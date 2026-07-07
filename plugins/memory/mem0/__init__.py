@@ -722,6 +722,28 @@ class Mem0MemoryProvider(MemoryProvider):
         self._shutdown_backend()
 
 
+# ----- Process-level singleton (2026-07-07 老板 P0 拍板, Qdrant lock conflict 治本) -----
+# 根因: hermes-gateway 等多进程并发 import 时, OSSBackend 反复构造 → qdrant_client local 模式
+#       对 <path>/.lock 申请 portalocker EXCLUSIVE|NON_BLOCKING, 第二次必 RuntimeError
+#       ('Storage folder ... is already accessed by another instance of Qdrant client').
+# 治本: register() 走 module-level 缓存, 首次实例化后所有 ctx.register_memory_provider 调用
+#       返回同一个 Mem0MemoryProvider instance, 保证 qdrant_local 锁只申请一次.
+_PROVIDER_SINGLETON = None
+_PROVIDER_SINGLETON_LOCK = threading.Lock()
+
+
 def register(ctx) -> None:
-    """Register Mem0 as a memory provider plugin."""
-    ctx.register_memory_provider(Mem0MemoryProvider())
+    """Register Mem0 as a memory provider plugin.
+
+    Process-level singleton (added 2026-07-07 老板拍板): the first call
+    instantiates the provider, subsequent calls in the same interpreter
+    return the same instance so the qdrant_client local lock isn't
+    thrashed across concurrent agent turns.
+    """
+    global _PROVIDER_SINGLETON
+    if _PROVIDER_SINGLETON is None:
+        with _PROVIDER_SINGLETON_LOCK:
+            if _PROVIDER_SINGLETON is None:
+                _PROVIDER_SINGLETON = Mem0MemoryProvider()
+                logger.info("[mem0] Process-level singleton initialized (7-7 Qdrant lock 治本)")
+    ctx.register_memory_provider(_PROVIDER_SINGLETON)
