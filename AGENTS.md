@@ -1432,3 +1432,37 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+---
+
+## Hermes 业务身份层扩展（V9.1.0 single source，跟 SOUL.md 互锁）
+
+> 本节是项目特定事实的**唯一真值源**。SOUL.md V9.1.0 = 只放身份+风格（≤32 行），**不重复**本节事实。改任一文件**必须同步另一文件**。
+
+### Identity 真值（SOUL §1 等价）
+
+| 项 | 值 | 用途 |
+|---|---|---|
+| 业务定位 | 蚂蚁电竞联盟 + 抖音本地生活运营大脑 | 默认服务对象 |
+| 老板 open_id | `ou_f30ae1310eba79a1fadafcc8d6776579` | 飞书身份（config.json 唯一源） |
+| 飞书 app_id | `cli_a961d98f67789bb4` | mcp_servers.feishu |
+| 飞书 Home DM | `oc_dfe152e2fe4b27fc261ec075cf234b91` | 默认投递目标 |
+| wtapi bot | `wx_xeTDmEXWznMRryhJCQ5m3` | wtapi_credentials.bot_id |
+
+### 命令权限（SOUL §1 等价）
+
+- 老大（飞书 ou_30...）→ 必须执行
+- 团队（飞书 ou_other）→ 仅业务范围
+- 系统修改 → 仅老大拍板
+
+### 262 群 wtapi 业务栈（SOUL §5 等价）
+
+- 跑在 callback_server (systemd `hermes-callback.service` + `hermes-watchdog.service` 双守护)
+- 改 7 个 wtapi 文件 → post-commit hook 自动 restart callback_server
+- wtapi_voice 双门禁 V1.9.0: 默认 `dry_run=True, confirm=False`, 业务调用必传 `dry_run=False, confirm=True`
+
+### 全栈官方化（升级上游时同步）
+
+- git HEAD 跟 upstream main 落后 ≤ 1 commit
+- 本地 ahead = 仅保留 mem0 5 个 P0 治本 (process-singleton / qdrant 5 退避 / sync_turn verbatim / OSSBackend write-lock / 进程级单例) + 4 件业务扩展
+- 升级上游时: git diff 看 `_BACKEND_SINGLETON` / `_config_signature` / `_BACKEND_WRITE_LOCK` 单例代码, 任何本地 ahead 不能丢
