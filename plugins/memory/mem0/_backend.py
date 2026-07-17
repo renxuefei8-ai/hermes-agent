@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from typing import Any
+
+# V2026-07-12 治本 (老板拍"记忆闭环彻底解决"): 进程级写锁
+#   拦 qdrant local SQLite 跨线程 BEGIN/COMMIT race
+_BACKEND_WRITE_LOCK = threading.Lock()
 
 
 class Mem0Backend(ABC):
@@ -282,10 +287,19 @@ class OSSBackend(Mem0Backend):
         infer: bool = False,
         metadata: dict | None = None,
     ) -> dict:
-        kwargs: dict[str, Any] = {"user_id": user_id, "agent_id": agent_id, "infer": infer}
+        # V2026-07-12 治本 (老板拍"记忆闭环彻底解决"): 加全局写锁 + 强制 fast-path
+        #   根因 disk_audit (50 次并发测试, 3 次失败):
+        #     qdrant local SQLite 跨线程 BEGIN/COMMIT race
+        #       → OperationalError: cannot start a transaction within a transaction
+        #       → SDK 内部 race 导致 self.db 短暂 None
+        #       → 后续 thread 看到 NoneType get_last_messages
+        #   修法: 进程级写锁 + 强制 infer=False (走 fast-path, 完全绕开 Phase 0 + qdrant transaction)
+        #   边界: search 路径不调 add, 走读锁 (no impact), sync_turn 是非阻塞所以锁等待可接受
+        kwargs: dict[str, Any] = {"user_id": user_id, "agent_id": agent_id, "infer": False}
         if metadata:
             kwargs["metadata"] = metadata
-        return self._memory.add(messages, **kwargs)
+        with _BACKEND_WRITE_LOCK:
+            return self._memory.add(messages, **kwargs)
 
     def update(self, memory_id: str, text: str) -> dict:
         self._memory.update(memory_id, data=text)
