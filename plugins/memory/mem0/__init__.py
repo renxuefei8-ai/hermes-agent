@@ -38,7 +38,13 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List
+
+# V2026-07-10 治本 (Ahead V3.0.2): OSSBackend 进程级单例
+#   同一进程内多线程并发 _create_backend() 时共享同一 backend 实例,
+#   避免每调用 new QdrantClient 抢 portalocker NON_BLOCKING.
+_BACKEND_SINGLETON: dict | None = None  # {"signature": str, "backend": Mem0Backend}
+_BACKEND_SINGLETON_LOCK = threading.Lock()
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -279,7 +285,58 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             if self._mode == "oss":
                 from ._backend import OSSBackend
-                return OSSBackend(self._config.get("oss", {}))
+                # V3.0.1 治本 (2026-07-09): Qdrant local path 锁冲突重试 + 进程级单例兜底
+                #   根因: hermes-gateway 持 ~/.hermes/mem0_qdrant/.lock (uW 独占), mem0_add
+                #         工具调 OSSBackend 时若 Qdrant portalocker NON_BLOCKING 失败必抛
+                #   修法: 重试 5 次 (指数退避 0.5+1+2+4+8 = 15.5s), 失败再 fallback to
+                #         :memory: 模式 (本次 session 内存, 不持久化但能写入)
+                # V3.0.2 治本 (2026-07-10): OSSBackend 进程级单例 + config 失效检测重置
+                #   根因: gateway PID 持 mem0_qdrant/.lock; V3.0.1 单例只覆盖 Mem0MemoryProvider,
+                #         不覆盖 OSSBackend instance; 每 _create_backend() 都新 OSSBackend →
+                #         新 QdrantClient → 在同一进程内 portalocker NON_BLOCKING 跟自己抢同一 .lock, 必败
+                #   修法: _BACKEND_SINGLETON 缓存 OSSBackend instance (同一进程多线程并发
+                #         调 _create_backend 时复用). 若 config 变化自动清单例重建.
+                oss_cfg = (self._config or {}).get("oss", {})
+                config_signature = self._config_signature(oss_cfg)
+                global _BACKEND_SINGLETON, _BACKEND_SINGLETON_LOCK
+                with _BACKEND_SINGLETON_LOCK:
+                    if _BACKEND_SINGLETON is not None and _BACKEND_SINGLETON.get("signature") == config_signature:
+                        cached = _BACKEND_SINGLETON["backend"]
+                        if cached is not None:
+                            return cached
+                    # 串行化首次构造 (5 次重试 + :memory: fallback)
+                    last_err = None
+                    for _attempt in range(5):
+                        try:
+                            backend = OSSBackend(oss_cfg)
+                            if _attempt > 0:
+                                logger.info("[mem0] OSSBackend init 第 %d 次重试成功 (锁释放)", _attempt + 1)
+                            _BACKEND_SINGLETON = {"signature": config_signature, "backend": backend}
+                            return backend
+                        except Exception as e:
+                            last_err = e
+                            logger.debug("[mem0] OSSBackend init 第 %d 次失败: %s", _attempt + 1, e)
+                            import time as _t
+                            _sleep_s = 0.5 * (2 ** _attempt)  # 0.5 / 1 / 2 / 4 / 8
+                            _t.sleep(_sleep_s)
+                    # 重试 5 次全失败 → 降级 :memory: 模式 (单例也存避免重复 new QdrantClient)
+                    logger.warning(
+                        "[mem0] OSSBackend 5 次重试全败 (%s), 降级 :memory: 模式 (本 session 内存)",
+                        last_err,
+                    )
+                    import copy as _cp
+                    oss_mem_cfg = _cp.deepcopy(oss_cfg)
+                    vs_cfg = oss_mem_cfg.get("vector_store", {}).get("config", {})
+                    vs_cfg["path"] = ":memory:"
+                    oss_mem_cfg["vector_store"]["config"] = vs_cfg
+                    try:
+                        mem_backend = OSSBackend(oss_mem_cfg)
+                        _BACKEND_SINGLETON = {"signature": config_signature, "backend": mem_backend}
+                        return mem_backend
+                    except Exception as e:
+                        logger.error("Mem0 backend failed to initialize (oss mode :memory:): %s", e)
+                        self._init_error = str(e)
+                        return None
             if self._host:
                 from ._backend import SelfHostedBackend
                 return SelfHostedBackend(self._api_key, self._host)
@@ -332,6 +389,14 @@ class Mem0MemoryProvider(MemoryProvider):
                 "Pausing API calls for %ds.%s",
                 count, _BREAKER_COOLDOWN_SECS, hint,
             )
+
+    def _config_signature(self, oss_cfg: dict) -> str:
+        """V3.0.2 治本: 生成 config 签名, 用于检测 config 变化后重置单例."""
+        import copy as _cp
+        import hashlib as _hl
+        return _hl.sha256(
+            json.dumps(_cp.deepcopy(oss_cfg), sort_keys=True, default=str).encode()
+        ).hexdigest()
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
@@ -475,9 +540,34 @@ class Mem0MemoryProvider(MemoryProvider):
         # Slow backend: skip injection; mem0_search tool remains the backstop.
         return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Mirror turn into Mem0 — VERBATIM ONLY (V2026-07-10 anti-hallucination cure).
+
+        根因 (7-10 老板拍板 disk_audit):
+          原版 infer=True → Mem0 server-side LLM fact-extract →
+          把对话里的推断 / 解读 / 解读性补完当事实入库 (经典污染样本: 编造
+          "User developing AMD outreach" + "annotated red circle... active interest",
+          老板 7-10 都没聊过 AMD). 后续 recall = 污染源.
+
+        治本铁律 V1.0.0:
+          1. **infer=False** —— verbatim 入库, 不让 server-side LLM 二次加工.
+             参照同文件 mem0_conclude / mem0_add 已用的写法, 行为对齐.
+          2. **只 mirror user 原话** —— assistant 内容可能含上一轮 LLM 推断
+             ("推断 / 我猜测 / 接下来..." 类开罐头), 不入库规避回声污染.
+          3. **空内容跳过** —— 防空白 sync 出空记忆.
+
+        边界 / 副作用:
+          - server 不做 fact-extract/dedup → 重复 user 原话可能入库多次;
+            老板"污染 = 错", "重复 = 可接受", V2026-07-10 拍板生效.
+          - sync_turn 仍是非阻塞 (沿用原版 _sync_lock + daemon thread).
+        """
         if self._backend is None or self._is_breaker_open():
+            return
+
+        # V2026-07-10 P0: 只 mirror user 原话. assistant 是 LLM 自身产出,
+        # 包含上一轮推断, 喂回去 = 二段污染 = 净负债.
+        payload = (user_content or "").strip()
+        if not payload:
             return
 
         def _sync():
@@ -486,14 +576,14 @@ class Mem0MemoryProvider(MemoryProvider):
                 return
             try:
                 messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
+                    {"role": "user", "content": payload},
                 ]
+                # V2026-07-10 P0: infer=False 关掉 server-side LLM 推断
                 backend.add(
                     messages,
                     user_id=self._user_id,
                     agent_id=self._agent_id,
-                    infer=True,
+                    infer=False,
                     metadata=self._write_metadata(),
                 )
                 self._record_success()
@@ -515,13 +605,23 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._backend is None:
-            err = getattr(self, "_init_error", "unknown error")
-            hint = ""
-            if self._mode == "oss":
-                vs = self._config.get("oss", {}).get("vector_store", {})
-                provider = vs.get("provider", "vector store")
-                hint = f" Check that {provider} is running and reachable."
-            return json.dumps({"error": f"Mem0 backend not initialized: {err}.{hint}"})
+            # V3.0.1 治本 (2026-07-09): backend 启动失败时, 每次 handle_tool_call 触发重试
+            #   修前: initialize() 一次性 _create_backend, 失败后 self._backend=None 永久
+            #         → 后续 mem0_add/search/list/update/delete 全废
+            #   修法: _backend is None 时重试 _create_backend (含 5 次重试 + :memory: fallback)
+            logger.info("[mem0] backend 不可用, 重试 _create_backend (含 5 次重试 + :memory: fallback)")
+            try:
+                self._backend = self._create_backend()
+            except Exception as _recreate_e:
+                logger.debug("[mem0] 重建 backend 失败: %s", _recreate_e)
+            if self._backend is None:
+                err = getattr(self, "_init_error", "unknown error")
+                hint = ""
+                if self._mode == "oss":
+                    vs = (self._config or {}).get("oss", {}).get("vector_store", {})
+                    provider = vs.get("provider", "vector store")
+                    hint = f" Check that {provider} is running and reachable."
+                return json.dumps({"error": f"Mem0 backend not initialized: {err}.{hint}"})
 
         if self._is_breaker_open():
             msg = "Mem0 temporarily unavailable (multiple consecutive failures). Will retry automatically."
