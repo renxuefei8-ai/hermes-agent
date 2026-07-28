@@ -140,6 +140,19 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     incomplete by definition; the model regenerates it on the retried turn.
     If a future path needs to preserve interrupted thinking, carry it in a
     provider-gated reasoning *field*, never in content.
+    INVARIANT — the scaffolding is provider-replay text, not transcript text.
+    ``[This response was interrupted by a user correction.]`` and its
+    ``Visible response before the interruption:`` header exist so the MODEL
+    understands its own reply was cut off. They are not prose the user wrote
+    or the agent said. Persisting them into ``content`` painted the raw
+    machinery as an assistant bubble on every reload (and merged it into the
+    preceding tool-call bubble), which is what made a steered transcript
+    unreadable. Carry the scaffolded form in the ``api_content`` sidecar --
+    the exact bytes replayed to the provider -- and keep ``content`` clean.
+    When nothing was on screen there is no clean form at all, so the row is
+    marked ``display_kind="hidden"``: still replayed to the model, dropped by
+    every transcript surface (desktop, TUI, CLI resume), exactly like the
+    compaction-reference rows.
     """
     visible = agent._strip_think_blocks(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
@@ -162,9 +175,22 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             f"{checkpoint}\n\n"
             f"{text}"
         )
-        messages.append({"role": "user", "content": correction})
+        # Transcript shows the user's own words; the provider replays the
+        # scaffolded form so it still sees the interrupted context.
+        messages.append(
+            {"role": "user", "content": text, "api_content": correction}
+        )
     else:
-        messages.append({"role": "assistant", "content": checkpoint})
+        entry: Dict[str, Any] = {
+            "role": "assistant",
+            "content": visible or checkpoint,
+            "api_content": checkpoint,
+        }
+        if not visible:
+            # Nothing reached the screen — this row carries no assistant prose
+            # at all, only the cut-off notice for the model.
+            entry["display_kind"] = "hidden"
+        messages.append(entry)
         messages.append({"role": "user", "content": text})
 
     agent._current_streamed_assistant_text = ""
@@ -1638,37 +1664,14 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
-        # Pad a textless assistant turn's empty content to a single space.
-        # Strict providers (Moonshot/Kimi via OpenRouter: "the message at
-        # position N with role 'assistant' must not be empty") reject the
-        # replay with HTTP 400 — and the session is poisoned for every
-        # subsequent turn.  This is the DURABLE repair for ALREADY-poisoned
-        # persisted sessions: the partial-stream-stub rows older builds
-        # wrote (content:'' finish_reason:'length') are rebuilt to '' on
-        # every reload — ``_rows_to_conversation`` strips whitespace, so a
-        # DB-side pad can't survive — and only a SEND-time pad repairs
-        # them.  It must run AFTER the whitespace-normalization pass above
-        # (which would strip the pad back to '') and after
-        # _drop_thinking_only_and_merge_users (which can leave a textless
-        # turn), but BEFORE apply_anthropic_cache_control rewrites content
-        # into list blocks.  Tool-call turns are exempt: ``content: ''``
-        # alongside ``tool_calls`` is accepted everywhere and normalizing
-        # it would alter prompt-cache keys.  codex_responses is exempt:
-        # empty assistant content is a designed first-class state there
-        # (commentary-phase turns persist with content:'') and the
-        # Responses wire has no empty-content validation.  Keying on the
-        # ACTIVE api_mode means a codex-written empty turn is still
-        # repaired the moment the session replays through a strict
-        # chat-completions provider.
-        if getattr(agent, "api_mode", None) != "codex_responses":
-            for am in api_messages:
-                if (
-                    am.get("role") == "assistant"
-                    and not am.get("tool_calls")
-                    and isinstance(am.get("content"), str)
-                    and not am["content"].strip()
-                ):
-                    am["content"] = " "
+        # NOTE (empty-content class fix): no send-time pad loop here.  The
+        # single owner for "never send a turn strict wire validation rejects
+        # as empty" is ``repair_empty_non_final_messages``, which runs inside
+        # ``_sanitize_api_messages`` above — the unconditional pre-send
+        # chokepoint shared with the summary path.  Its placeholder is
+        # non-whitespace, so it survives the whitespace-normalization pass
+        # regardless of ordering (a single-space pad here previously had to
+        # be sequenced after normalization to survive, forking the concept).
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
@@ -2510,6 +2513,17 @@ def run_conversation(
                     _backoff_touch_counter = 0
                     while time.time() < sleep_end:
                         if agent._interrupt_requested:
+                            # A redirect uses the interrupt machinery to cancel
+                            # only the live request. Aborting the retry here
+                            # with clear_interrupt() would DESTROY the pending
+                            # correction and kill the turn with "Operation
+                            # interrupted" — the exact mid-stream steer loss
+                            # users hit when a redirect lands during provider
+                            # backoff. Rebuild from the correction instead,
+                            # mirroring the InterruptedError handler.
+                            if agent.clear_interrupt(preserve_redirect=True):
+                                _retry.restart_with_redirected_messages = True
+                                break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
@@ -2531,6 +2545,8 @@ def run_conversation(
                                 f"retry backoff ({retry_count}/{max_retries}), "
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
+                    if _retry.restart_with_redirected_messages:
+                        break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
@@ -4023,6 +4039,12 @@ def run_conversation(
 
                 # Check for interrupt before deciding to retry
                 if agent._interrupt_requested:
+                    # Preserve a pending redirect (mid-stream correction): the
+                    # user is steering, not stopping. Rebuild the turn from the
+                    # correction instead of aborting with a dead-end interrupt.
+                    if agent.clear_interrupt(preserve_redirect=True):
+                        _retry.restart_with_redirected_messages = True
+                        break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
@@ -5259,6 +5281,12 @@ def run_conversation(
                 _backoff_touch_counter = 0
                 while time.time() < sleep_end:
                     if agent._interrupt_requested:
+                        # Same preserve-redirect rule as the retry-wait above:
+                        # a steering correction must survive backoff, not die
+                        # as "Operation interrupted".
+                        if agent.clear_interrupt(preserve_redirect=True):
+                            _retry.restart_with_redirected_messages = True
+                            break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
@@ -5280,6 +5308,11 @@ def run_conversation(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
+                if _retry.restart_with_redirected_messages:
+                    # Leave the retry loop — the check right below rebuilds this
+                    # iteration from the correction instead of re-firing the
+                    # stale request.
+                    break
         
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the

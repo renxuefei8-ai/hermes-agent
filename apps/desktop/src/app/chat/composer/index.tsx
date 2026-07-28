@@ -50,6 +50,7 @@ import { useComposerUrlDialog } from './hooks/use-composer-url-dialog'
 import { useComposerVoice } from './hooks/use-composer-voice'
 import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
+import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
 import { QueuePanel } from './queue-panel'
 import {
   composerPlainText,
@@ -449,9 +450,9 @@ export function ChatBar({
 
     // Links in the paste land as `@url:` chips rather than a wall of URL text —
     // the same reference the "Add URL" dialog inserts, parsed in place so a link
-    // mid-sentence keeps its position.
+    // mid-sentence keeps its position. Bare `@path` tokens promote the same way.
     recordUndoPoint()
-    insertComposerContentsAtCaret(event.currentTarget, linkifyUrls(pastedText))
+    insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)))
     scheduleFlushEditorToDraft(event.currentTarget)
   }
 
@@ -513,6 +514,16 @@ export function ChatBar({
     // A typed link finished with a space chips like a pasted one — the space
     // itself rides along inside the insert.
     if (withUndoPoint(() => chipTypedUrlOnSpace(event))) {
+      event.preventDefault()
+      flushEditorToDraft(event.currentTarget)
+
+      return
+    }
+
+    // Same for a bare `@path` — a hand-typed or Tab-descended path chips into
+    // the `@file:`/`@folder:` ref it means, instead of submitting as plain text
+    // the backend never resolves.
+    if (withUndoPoint(() => chipTypedPathOnSpace(event))) {
       event.preventDefault()
       flushEditorToDraft(event.currentTarget)
 
@@ -724,12 +735,21 @@ export function ChatBar({
         return
       }
 
-      // Empty Enter while busy is a no-op — interrupting is explicit (Stop/Esc),
-      // never a stray Enter after sending. With a payload, submitDraft queues it.
-      // Gate on the live DOM payload (not the render-lagged composer state) so a
-      // message typed fast / via IME while busy still reaches submitDraft() and
-      // gets queued instead of being mistaken for an empty Enter.
+      // Empty Enter while busy. With prompts queued this is the double-send:
+      // the first Enter put the words in the queue, a second sends them now
+      // (promote + interrupt + drain on settle), mirroring the idle empty-Enter
+      // drain above. With nothing queued it stays a no-op — interrupting is
+      // explicit (Stop/Esc), never a stray Enter after sending. Gate on the live
+      // DOM payload (not the render-lagged composer state) so a message typed
+      // fast / via IME while busy still reaches submitDraft() and gets queued
+      // instead of being mistaken for an empty Enter.
       if (busy && !hasLivePayload) {
+        const head = queuedPrompts.find(entry => entry.id !== queueEdit?.entryId)
+
+        if (head) {
+          sendQueuedNow(head.id)
+        }
+
         return
       }
 

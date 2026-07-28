@@ -33,6 +33,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -6246,6 +6247,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
             continue
+        # An explicit display_kind="hidden" row is model-facing scaffolding
+        # (compaction references, interrupted-turn checkpoints). The string
+        # sniff below only catches the "[System:" convention; honor the
+        # declared field too, or scaffolding reaches every surface that reads
+        # this projection.
+        if m.get("display_kind") == "hidden":
+            continue
         content_text = _coerce_message_text(m.get("content"))
         if _is_display_hidden_marker(role, content_text):
             continue
@@ -6653,7 +6661,7 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any
+    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -6666,8 +6674,15 @@ def _handle_busy_submit(
     Modes: ``interrupt`` (default) → redirect the live turn, falling back to
     hard interrupt + queue for older agents; ``queue`` → queue without
     interrupting; ``steer`` → inject after the current atomic action.
+
+    ``queued=True`` (client's queue drain, ``prompt.submit`` param) overrides
+    the mode entirely: the message was explicitly queued as "run after", so it
+    must NEVER become a live-turn correction or interrupt. Without this, a
+    drain that loses the settle race (client observed idle, server still
+    unwinding the turn) redirected the live turn with next-turn text — queue
+    semantics betrayed by a millisecond race the user can't see.
     """
-    mode = _load_busy_input_mode()
+    mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
@@ -10748,6 +10763,14 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
+    if accepted:
+        # Record the correction on the live turn exactly like session.redirect
+        # does. Without this, a resume/reconnect while the turn is running
+        # rebuilds the transcript from the inflight snapshot and the steered
+        # text has no user bubble — the "my message vanished on reload" loss.
+        with session["history_lock"]:
+            _record_inflight_correction(session, text)
+            session["last_active"] = time.time()
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
@@ -10837,7 +10860,10 @@ def _(rid, params: dict) -> dict:
                 busy_transport = t or session.get("transport")
             else:
                 break
-        busy_response = _handle_busy_submit(rid, sid, session, text, busy_transport)
+        busy_response = _handle_busy_submit(
+            rid, sid, session, text, busy_transport,
+            queued=bool(params.get("queued")),
+        )
         if busy_response is not None:
             return busy_response
         # The old turn finished between the two lock acquisitions. Retry the
@@ -11682,6 +11708,7 @@ def _run_prompt_submit(
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
+        result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
@@ -12001,6 +12028,15 @@ def _run_prompt_submit(
                     result.get("failed") or result.get("partial")
                 ):
                     raw = f"Error: {result.get('error')}"
+                # "Operation interrupted: waiting for model response (…)" is
+                # cancellation metadata, not assistant prose. gateway/run.py
+                # and the ACP adapter already suppress this sentinel; without
+                # this the desktop paints it as the agent's reply whenever a
+                # stop/steer lands mid-request (#7921).
+                if status == "interrupted" and isinstance(raw, str) and raw.strip().startswith(
+                    INTERRUPT_WAITING_FOR_MODEL_PREFIX
+                ):
+                    raw = ""
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
@@ -12257,6 +12293,16 @@ def _run_prompt_submit(
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
+        # Leftover /steer: the steer arrived after the last tool batch (e.g.
+        # during the final API call), so the agent couldn't inject it and
+        # returned it in result["pending_steer"]. Requeue it as the next turn
+        # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
+        # A real queued prompt still wins: the merge in _enqueue_prompt keeps
+        # both texts.
+        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+            with session["history_lock"]:
+                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
             return
 
