@@ -171,6 +171,28 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = (
     "wait", "requests remaining", "periodic", "window", "per minute", "per second",
 )
 
+# Some vendors answer a rolling quota window with HTTP 403 instead of 429 - Kimi/coding-plan
+# returns ``access_terminated_error`` ("You've reached your 5-hour usage limit. Your quota
+# will reset when the current 5-hour window ends.") on 403. That is a periodic allowance
+# that lifts on its own, NOT a dead credential: classifying it as ``auth`` benches the key as
+# permanently broken and the chain never returns to it after the window rolls (#115202).
+# Gate on the same transient signals the 429 path uses so a real bad-key 403 ("invalid api
+# key", no reset/window wording) keeps its auth classification.
+_QUOTA_WINDOW_403_PATTERNS = ("access_terminated", "usage limit", "quota")
+_QUOTA_WINDOW_403_CODES = frozenset({"access_terminated_error"})
+
+
+def _is_quota_window_403(c: "_Ctx") -> bool:
+    """A 403 whose body names a rolling usage/quota window that resets by itself."""
+    if c.status_code != 403:
+        return False
+    if c.code and c.code in _QUOTA_WINDOW_403_CODES:
+        return True
+    if not any(p in c.msg for p in _QUOTA_WINDOW_403_PATTERNS):
+        return False
+    # Require the reset/period wording so "invalid api key" style 403s never land here.
+    return _has_usage_limit_transient_signal(c.msg, c.body, c.headers)
+
 # 413 detected from message text (proxies embed the status or re-wrap
 # Anthropic's "request_too_large" type without one).
 _PAYLOAD_TOO_LARGE_PATTERNS = (
@@ -834,6 +856,14 @@ def _nous_welcome_tier(c: _Ctx) -> Optional[Verdict]:
 def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     """Highest-priority provider-specific shapes that a status code would misroute."""
     msg, status = c.msg, c.status_code
+    # A rolling quota window answered with 403 is throttling, not a dead credential: keep it
+    # off the auth path so the bench expires and the chain returns after the window rolls.
+    if _is_quota_window_403(c):
+        reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+        ctx: dict = {"quota_window": True}
+        if reset is not None and reset > 0:
+            ctx["reset_at"] = time.time() + reset
+        return _v(_R.rate_limit, should_fallback=True, error_context=ctx)
     welcome = _nous_welcome_tier(c)
     if welcome is not None:
         return welcome

@@ -6800,7 +6800,27 @@ def _build_call_kwargs(
             provider_norm == "anthropic" or projection.messages_wire or _nous_on_messages_wire(provider_norm, model)
             or _endpoint_speaks_anthropic_messages(raw_base) or _is_anthropic_compat_endpoint(provider_norm, raw_base)
         ):
-            kwargs["_reasoning_config"] = dict(reasoning_config)
+            # V2026-10-09 治本 (老板问报错 "Completions.create() got an unexpected
+            # keyword argument '_reasoning_config'" → 实证日志 5 次同一报错):
+            #   _is_anthropic_compat_endpoint() 只按 provider 名判定, 而
+            #   _ANTHROPIC_COMPAT_PROVIDERS 写死含 minimax/minimax-cn/minimax-oauth。
+            #   但 MiniMax 有两条线: /anthropic 走 Anthropic Messages, 而
+            #   https://api.minimax.chat/v1 是 OpenAI chat.completions 兼容线。
+            #   后者经该守卫被误判成 Messages 线 → 注入私有 kwarg → 真实 OpenAI SDK
+            #   的 Completions.create() 不认 → TypeError (仅影响会话标题升级, 主回复不受影响)。
+            #   修法: URL 形状是比 provider 名更具体的证据, 显式声明的 OpenAI 线优先。
+            #   仅收窄本守卫, 不动 _is_anthropic_compat_endpoint 本身 —— 后者另外三处
+            #   (图片块转换 / _forwards_max_tokens) 依赖 MiniMax 的 Messages 兼容特性, 改了会误伤。
+            #   URL 判定复用 runtime_provider 的权威探测 (aux 3803/7542 已用同一模块, 无循环依赖)。
+            if provider_norm in _ANTHROPIC_COMPAT_PROVIDERS and not _endpoint_speaks_anthropic_messages(raw_base):
+                from hermes_cli.runtime_provider import _detect_api_mode_for_url
+                # /v1 → None/chat_completions (OpenAI 线) ⇒ 不注入; /anthropic → anthropic_messages ⇒ 照旧注入
+                if _detect_api_mode_for_url(raw_base) != "anthropic_messages":
+                    pass  # URL 明确是 OpenAI 兼容线, 跳过下面的注入
+                else:
+                    kwargs["_reasoning_config"] = dict(reasoning_config)
+            else:
+                kwargs["_reasoning_config"] = dict(reasoning_config)
     # Conversation affinity (OpenCode relay, opt-in custom-provider header) — same key as the main
     # turn so compression/title/vision calls stay on the conversation's warm backend.
     from agent.opencode_affinity import merge_session_affinity_headers

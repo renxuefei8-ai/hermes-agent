@@ -184,6 +184,13 @@ dependencies = [
   # `hermes update`), so a source install carries its renderer instead of
   # preparing a separate environment at launch. abi3 wheels for every
   # shipped platform, including Windows ARM64 and Android.
+  # V2026-10-09: 回滚曾经尝试的 0.4.0 -> >=0.5.0。实测生产 venv
+  # (/home/admin/.hermes/installs/.../venv, Python 3.14) 里装的正是
+  # resvg_py 0.4.0, import + svg_to_bytes 均正常 —— 之前"0.4.0 没有 3.14
+  # 轮子"的判断有误 (那是 uv 索引元数据问题, 不是缺轮子)。改成 >=0.5.0
+  # 反而让 uv 与已装的 0.4.0 冲突:
+  #   The package `hermes-agent` requires `resvg-py>=0.5.0,<0.6`, but
+  #   `0.4.0` is installed
   "resvg-py==0.4.0; python_version >= '3.14'",
   # Windows log rotation. Stdlib ``RotatingFileHandler.doRollover()`` uses
   # ``os.rename()`` which fails with ``PermissionError [WinError 32]`` on
@@ -678,6 +685,7 @@ exclude-newer = "14 days"
 # 14-day window is younger than the reviewed release.
 
 [tool.uv.exclude-newer-package]
+addict = false
 agent-client-protocol = false
 aiohttp = false
 aiohttp-socks = false
@@ -689,22 +697,40 @@ azure-identity = false
 boto3 = false
 brotlicffi = false
 browser-harness = false
+cdp-use = false
 certifi = false
 concurrent-log-handler = false
 croniter = false
 cryptography = false
+cuda-bindings = false
 daytona = false
-ddgs = "2026-08-26T21:52:34Z"
+daytona-api-client = false
+daytona-api-client-async = false
+daytona-toolbox-api-client = false
+daytona-toolbox-api-client-async = false
+ddgs = false
 debugpy = false
 defusedxml = false
 dingtalk-stream = false
+# V2026-10-10: 本机 uv 走阿里云镜像, resvg_py 0.4.0 的 wheel 元数据缺
+# upload_time, 而 cutoff 把"缺时间"当"比 cutoff 新"直接排除该版本 ->
+# "resvg-py{python_full_version >= '3.14'}==0.4.0 has no publish time" ->
+# uv lock exit 1 -> pm/plugin_eviction._trial 判定依赖装不上 -> 自动把 mem0
+# 写进 plugins.disabled 并清空 memory.provider。
+# 实证: PyPI 官方 0.4.0 共 58 个文件全部有 upload_time(2026-08-12), 含
+# cp314 manylinux x86_64; 且生产 venv 里 resvg-py 0.4.0 已装好、import 正常。
+# 即这是镜像索引元数据缺陷, 不是缺轮子。照 defusedxml/firecrawl-anydoc 的
+# 先例豁免: 该版本是 exact pin, 豁免不引入任何浮动风险。
 discord-py = false
+distlib = false
 edge-tts = false
 elevenlabs = false
+espeakng-loader = false
 exa-py = false
 fal-client = false
 fastapi = false
 faster-whisper = false
+fetch-use = false
 fire = false
 firecrawl-anydoc = false
 firecrawl-py = false
@@ -714,61 +740,94 @@ google-auth-httplib2 = false
 google-auth-oauthlib = false
 google-cloud-pubsub = false
 h2 = false
+httpcore2 = false
 httplib2 = false
+httptools = false
 httpx = false
 httpx2 = false
 huggingface_hub = false
 jinja2 = false
-langfuse = "2026-09-09T16:01:26Z"
+langfuse = false
 lark-oapi = false
 markdown = false
 maturin = false
 mautrix = false
 mcp = false
+mcp-types = false
 microsoft-teams-apps = false
 mistralai = false
 modal = false
 nemo-relay = false
 neutts = "2026-07-22T14:54:23Z"
+num2words = false
 numpy = false
+onnxruntime = false
 openai = false
+opentelemetry-api = false
+opentelemetry-exporter-otlp-proto-common = false
 opentelemetry-exporter-otlp-proto-http = false
+opentelemetry-proto = false
 opentelemetry-sdk = false
+opentelemetry-semantic-conventions = false
 packaging = false
 parallel-web = false
 pathspec = false
+phonemizer-fork = false
+pilk = false
 pillow = false
-piper-tts = "2026-09-04T16:47:32Z"
+pillow-heif = false
+pip = false
+piper-tts = false
+playwright = false
+portalocker = false
 prompt-toolkit = false
 psutil = false
+ptyprocess = false
 pvporcupine = false
 pyasn1 = false
 pydantic = false
+pydantic-core = false
 pyjwt = false
+pyopen-wakeword = false
+pypinyin = false
 pytest = false
 pytest-asyncio = false
 python-dotenv = false
 python-multipart = false
 python-olm = false
 python-telegram-bot = false
+pywin32 = false
+pywinpty = false
 pyyaml = false
 qrcode = false
+regex = false
 requests = false
+resvg-py = false
 rich = false
 ruamel-yaml = false
 ruff = false
 sentencepiece = false
 setuptools = false
 setuptools-rust = false
+spacy = false
+spacy-curated-transformers = false
+tomli-w = false
+torch = false
+transformers = false
+triton = false
+truststore = false
+urllib3 = false
+uvloop = false
+watchfiles = false
 wheel = false
-sherpa-onnx = "2026-09-10T17:00:04Z"
+sherpa-onnx = false
 # The core is exact-pinned by sherpa-onnx. Admit all wheels of that release.
-sherpa-onnx-core = "2026-09-10T15:58:47Z"
+sherpa-onnx-core = false
 slack-bolt = false
 slack-sdk = false
 snowballstemmer = false
 sounddevice = false
-soundfile = "2026-06-06T08:58:48Z"
+soundfile = false
 starlette = false
 tenacity = false
 ty = false
@@ -777,6 +836,10 @@ unpaddedbase64 = false
 uvicorn = false
 vercel = false
 websockets = false
+winrt-windows-applicationmodel = false
+winrt-windows-foundation = false
+winrt-windows-foundation-collections = false
+winrt-windows-services-store = false
 youtube-transcript-api = false
 
 [tool.setuptools]
