@@ -1248,7 +1248,18 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # V4.0.0 (2026-10-14): fetch the token immediately before each item_list send instead of once up front.
         # A long media upload (CDN round-trips) can outlast the token's freshness window; re-reading the store
         # here means caption+media each get the newest cached token (measured 26% vs 85% tokenless).
-        context_token = self._token_store.get(self._account_id, chat_id)
+        # V4.2.0 (2026-10-14): per-item token, read fresh inside the loop.
+        # This used to be a single variable read once before the loop, and the session-expired
+        # fallback did `context_token = None` on it. Two defects fell out of that:
+        #   (a) unbounded retry — no `retried_without_token` guard here (the text path has one),
+        #       so a server that keeps answering "session expired" is looped against forever;
+        #   (b) token bleed across items — once caption fell back, the image that follows went
+        #       out tokenless even though a fresh token was sitting in the store. Measured in
+        #       test_ilink_v42_media.py T2: caption ['CT-FRESH', None], image [None].
+        # Fix: `fresh_token` is re-read from the store for EVERY item and is never mutated;
+        # the degraded attempt uses a separate per-call `attempt_token`, so one item's
+        # fallback cannot poison the next. 11 media sends / 0 failures in production means
+        # neither defect had fired yet — these were latent, not observed.
         # iLink expects aes_key as base64(hex_string), not base64(raw_bytes) — otherwise images render as grey boxes.
         item_kwargs = {
             "encrypt_query_param": encrypted_query_param, "aes_key_for_api": base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii"),
@@ -1261,18 +1272,46 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         last_message_id = ""
         for item_list in item_lists:
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            # V4.2.0 (2026-10-14): this loop was a bare `while True` with no attempt counter.
+            # Two real defects, both invisible in the logs because the media path is only
+            # reached rarely:
+            #   (a) unbounded retry — the text path guards the tokenless fallback with
+            #       `retried_without_token`, this one did not, so a server that keeps
+            #       answering "session expired" is looped against forever;
+            #   (b) token bleed across items — `context_token = None` wrote the loop-carried
+            #       variable, so once item 1 fell back it stayed None for items 2..N even
+            #       though a fresh token had been re-read by send() before this call.
+            # Measured: 11 media sends, 0 failures, so this never fired in production —
+            # it was a latent hang, not an observed one. Fixed to match the text path.
+            retried_without_token = False
+            media_attempt = 0
+            ret, errcode = None, None          # bound before first read (used in the give-up message)
+            resp = None                         # likewise, referenced in the give-up message
+            # V4.2.0: read the token fresh FOR THIS ITEM and never mutate it. The degraded
+            # retry uses `attempt_token`, so this item's fallback cannot poison the next
+            # item's first attempt (which is what test T2 measured before the fix).
+            fresh_token = self._token_store.get(self._account_id, chat_id)
+            attempt_token = fresh_token
             while True:
+                media_attempt += 1
+                if media_attempt > self._send_chunk_retries + 2:
+                    raise RuntimeError(
+                        f"iLink sendmessage gave up after {media_attempt - 1} attempts for media: "
+                        f"ret={ret} errcode={errcode} errmsg={(resp or {}).get('errmsg') if isinstance(resp, dict) else None}"
+                    )
                 resp = await _send_items(
                     self._send_session, base_url=self._base_url, token=self._token, to=chat_id, item_list=item_list,
-                    context_token=context_token, client_id=last_message_id)
+                    context_token=attempt_token, client_id=last_message_id)
                 ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                 if (ret is None or ret == 0) and (errcode is None or errcode == 0):
                     break
                 # Same stale-session fallback as _send_text_chunk: re-send once without context_token.
                 # V4.0.0 (2026-10-14): keep the cached token for the NEXT turn — see _send_text_chunk for
                 # the measured 26%-with-token vs 85%-tokenless failure rates that make eviction harmful.
-                if _is_session_expired(resp, ret, errcode) and context_token:
-                    context_token = None
+                # V4.2.0: assign to attempt_token only; fresh_token stays intact for the next item.
+                if _is_session_expired(resp, ret, errcode) and attempt_token and not retried_without_token:
+                    retried_without_token = True
+                    attempt_token = None
                     logger.warning("[%s] session expired for %s; re-sending media without context_token (cached token kept for later turns)", self.name, _safe_id(chat_id))
                     continue
                 errmsg = resp.get("errmsg") or resp.get("msg")
