@@ -1430,12 +1430,60 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
         skills_by_category.setdefault(category, []).append((entry["load_name"], desc))
 
 
+def _index_max_description_chars() -> int:
+    """``skills.index_max_description_chars`` — per-row description cap in the skill index.
+
+    0 (the default, and any unreadable value) renders every description in full, which is the
+    shipped behaviour. Set it to shrink the ``## Skills`` block that is resent on every turn:
+    with hundreds of skills the index is often the largest fixed block in the system prompt.
+    The skill name always survives, so ``skill_view(name)`` still resolves — only the model's
+    first-glance recall of *why* to load it gets less precise.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        raw = cfg_get(load_config(), "skills", "index_max_description_chars", default=0)
+        value = int(raw)
+    except Exception:
+        return 0
+    return max(0, value)
+
+
+def _truncate_index_description(desc: str, limit: int) -> str:
+    """Shorten a skill-index description to *limit* chars, marking how much was cut.
+
+    Cuts on a whitespace boundary so a word (and any URL / path / flag inside the
+    description) is never split in half. ``… [+N chars]`` marks the cut so the model can
+    tell a shortened row from a complete one — but only when the marker is shorter than
+    what it replaces, otherwise the "trimmed" row would come out *longer* than the original
+    (a cap just below the upstream limit trims 1 char and then pays 12 for the note).
+    """
+    if len(desc) <= limit:
+        return desc
+    head = desc[:limit]
+    cut = head.rfind(" ")
+    # Only honour the word boundary if it does not throw away most of the budget.
+    if cut > limit * 0.6:
+        head = head[:cut]
+    omitted = len(desc) - len(head)
+    marker = f"… [+{omitted} chars]"
+    # A marker wider than the text it replaces is pure overhead — emit the plain head.
+    return f"{head.rstrip()}{marker}" if len(marker) < omitted else head.rstrip()
+
+
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
+    max_desc_chars: int = 0,
 ) -> str:
-    """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
-    sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
+    """Render the ## Skills block; ``""`` when there is nothing to list. *unloadable* names (different skills
+    sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row
+    skill_view would refuse.
+
+    *max_desc_chars* > 0 truncates each row's description at a word boundary and appends
+    ``… [+N chars]``. The row still names the skill, so ``skill_view(name)`` still resolves it — a
+    truncated description costs recall precision, never capability. 0 (the default) renders every
+    description in full, which is the shipped behaviour.
+    """
     if not skills_by_category:
         return ""
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
@@ -1464,6 +1512,8 @@ def _render_skills_index(
         for name, desc in sorted(entries, key=lambda x: x[0]):  # stable: first entry per name wins
             if name not in seen:
                 seen.add(name)
+                if desc and max_desc_chars > 0 and len(desc) > max_desc_chars:
+                    desc = _truncate_index_description(desc, max_desc_chars)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
     from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
     if is_single_query_session():
@@ -1516,12 +1566,15 @@ def _build_skills_system_prompt_inner(
     manifest = _build_skills_manifest(skills_dir)
     files = frozenset((rel, *sig) for rel, sig in manifest.items())
     files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _build_skills_manifest(d).items()}
+    # The index-description cap is part of the key: it changes the rendered text without any
+    # skill file changing, so a snapshot built under a different cap must not be reused.
+    max_desc_chars = _index_max_description_chars()
     cache_key = (
         str(skills_dir), tuple((t, str(d)) for t, d in extra_roots), files,
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(), tuple(plugin_rows),
+        _oneshot_prompt_variant(), tuple(plugin_rows), max_desc_chars,
     )
     snapshot = _load_skills_snapshot(skills_dir, manifest)
     app_gated = snapshot is not None and any(
@@ -1591,7 +1644,7 @@ def _build_skills_system_prompt_inner(
             logger.debug("Could not write skills prompt snapshot: %s", e)
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable, max_desc_chars)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
