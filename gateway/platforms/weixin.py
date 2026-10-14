@@ -4,7 +4,7 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 
 from __future__ import annotations
 
-import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid
+import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, random, re, secrets, tempfile, textwrap, time, uuid
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -1022,8 +1022,15 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         if attempt >= self._send_chunk_retries:
                             break
                         attempt += 1
-                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                        logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
+                        # V4.1.0 (2026-10-14): 指数退避 + 抖动。旧代码对 ret=-2 (iLink 限流) 固定退 3s,
+                        # 而实测服务端限流窗口是**分钟级** —— 固定 3s 让 4 次重试全部落在同一个限流
+                        # 窗口内 (16:28:33/37/47 连打 3 次全败), 既救不回来又消耗 token。
+                        # 治本: 指数退避 + 抖动, 首个退避就跨出 10s, 总时长跨分钟级才有可能等到窗口开。
+                        # 抖动同时防止多个义务同步重试互相踩。
+                        wait = self._send_chunk_retry_delay_seconds * (2 ** attempt) * 5.0
+                        wait *= 0.75 + random.random() * 0.5      # ±25% 抖动
+                        logger.warning("[%s] rate limited for %s; backing off %.1fs (attempt %d/%d)",
+                                       self.name, _safe_id(chat_id), wait, attempt, self._send_chunk_retries + 1)
                         await asyncio.sleep(wait)
                         continue
                     self._rate_limit_events.clear()
@@ -1034,7 +1041,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     if attempt >= self._send_chunk_retries:
                         break
                     attempt += 1
-                    wait = self._send_chunk_retry_delay_seconds * attempt
+                    # V4.1.0 (2026-10-14): 指数退避 + 抖动, 同限流分支。stale session 的等待窗口
+                    # 同样远大于线性 1/2/3s —— 老板的新消息才是解药, 重试只是等 token 刷新。
+                    wait = self._send_chunk_retry_delay_seconds * (2 ** attempt) * 5.0
+                    wait *= 0.75 + random.random() * 0.5
                     logger.warning("[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
                                    self.name, _safe_id(chat_id), attempt, self._send_chunk_retries + 1, wait, exc)
                     if wait > 0:
