@@ -59,6 +59,58 @@ _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
 assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 
+# WeChat/iLink refuses a bot-initiated push while the peer has not messaged the bot since the last
+# send: ``ret=-2 errmsg='prepare failed'``. It is NOT a dead chat and NOT a flood penalty -- the very
+# next inbound from that peer re-opens the session and the identical text sends fine. Classified as a
+# generic rejection it burned the 3-attempt budget on backoff (30s, 120s), then ``retry_not_before``
+# returned ``None``, so every sweep ``continue``d: the row was neither redelivered nor abandoned and the
+# answer evaporated silently -- the user's question was answered, work ran, and their phone stayed silent.
+#
+# === 2026-10-13 修正: 上面那个假设已被当天数据证伪, 必须回退豁免 ===
+# 当天实测: attempts=62, created 23:39 updated 23:44, 期间老板发了 23:27/23:30/23:35/23:44
+# 四条 fresh inbound, session 始终没有恢复。也就是说 "下一条 inbound 会重建 session" 在这条
+# session 上不成立 —— iLink 一旦要求重新配对, 就必须用户主动重新配对, 等多久都没用。
+# 豁免 MAX_ATTEMPTS 的后果是: 送不出的旧回答每 ~6 分钟重试一次, 重试 62 轮, 而且
+# gateway.run_turn.py:3776 的 queued-lane 以 "final stream delivery not confirmed" 为条件
+# 等这条投递确认 —— 队列被一条永远送不出的旧消息锁死, 老板的新消息因此进不了 agent
+# (实测 inbound message: 计数为 0, 正是用户看到的「对方正在输入中…」然后没反应)。
+#
+# 正确治法: stale-session 仍是"不该静默蒸发"的错误 (不能让它耗尽预算后悄悄消失), 但必须有界:
+# 给它一个独立的、更小的 STALE_SESSION_ATTEMPTS 上限, 到点转 abandoned 留痕, 让队列能往下走。
+# 保留"不静默"这个原始诉求, 去掉"无限重试"这个错误结论。
+_STALE_SESSION_RE = re.compile(
+    r"session not ready|prepare failed|the user must send the bot a message first",
+    re.IGNORECASE,
+)
+
+# iLink 需要重新配对, 重发同一份内容无意义 —— 3 次足够覆盖短暂的 session 抖动,
+# 超限即 abandoned (可查、可人工补投), 而不是无限重试堵死队列。
+# V4.0.0 (2026-10-14) 上调 3 -> 8, 宽限 20min -> 45min, 并新增"老板是否刚发过消息"豁免:
+# 20 天实测 (977 次发送) 证明 stale-session 绝大多数是**凭证过期**而非"必须重新配对" ——
+#   带 context_token 失败率 26%, 不带 token 85%; 失败率随 token 年龄单调上升
+#   (30s 内 24% -> 20 分钟后 77%), 回合内第 2/3 条发送失败 43%/61%。
+# 也就是说: 老板每发一条消息就刷新一次凭证, 一条消息只换一次发送机会。
+# 原参数 (3 次 / 20 分钟) 让 65 条真实回答在老板还在线时就判死, 老板一个字都没看到。
+# 配合 weixin.py V4.0.0 (不再删除缓存 token + 每个 chunk 重取新 token), 重投成功率显著提升,
+# 所以这里有空间放宽上限而不会重现 10-13 那次"僵尸队列锁死 inbound"的事故:
+# 上限 8 次 + 45 分钟硬墙 —— 双重上界, 队列不可能被一条送不出的消息无限占住。
+STALE_SESSION_ATTEMPTS = 8
+# 同一内容在该窗口内重复失败 → 判定需要人工重新配对, 立刻停手, 不再每 6 分钟骚扰
+STALE_SESSION_GIVE_UP_SECONDS = 45 * 60
+
+
+def is_stale_session_error(error: Any) -> bool:
+    """True for iLink's ``prepare failed`` refusal: the peer must re-pair with the bot before the
+    bot may push again. Recoverable only by the *user re-pairing* — NOT by the peer merely messaging,
+    so it gets its own small attempt budget instead of the generic one or an unlimited one."""
+    return _STALE_SESSION_RE.search(str(error or "")) is not None
+
+
+def stale_session_attempts_exhausted(attempts: int, age_seconds: float) -> bool:
+    """Bounded retry for stale-session refusals: stop at STALE_SESSION_ATTEMPTS, or earlier if the
+    row has been failing for longer than STALE_SESSION_GIVE_UP_SECONDS (needs re-pairing, not retry)."""
+    return attempts >= STALE_SESSION_ATTEMPTS or age_seconds > STALE_SESSION_GIVE_UP_SECONDS
+
 # A final send the platform refused with flood control is the other transient case: a 429 means the
 # refused request was never accepted, and the platform said how long to wait. Adapters fail such sends
 # closed as ``flood_control:<seconds>`` on purpose (#91969) so that this ledger owns the wait instead of
@@ -151,10 +203,14 @@ def flood_not_before(updated_at: Any, last_error: Any) -> float:
 def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optional[float]:
     """Earliest moment a failed row may be resent, or ``None`` for a row the runtime must leave alone:
     a flood refusal keeps the platform's own wait, an allowlisted reconnect error is due at once, a
-    whole-chat death is final, and any other rejection backs off by the attempts already spent — but
+    whole-chat death is final, and any other rejection backs off by the attempts already spent -- but
     never spends the LAST budgeted attempt. An unclassified outage can outlast any timer, and a row
     the timer abandoned would be lost for good; leaving one attempt keeps it recoverable by the boot
-    sweep after a restart, which is a real recovery signal."""
+    sweep after a restart, which is a real recovery signal.
+
+    iLink's ``prepare failed`` (see ``is_stale_session_error``) is the exception that keeps its whole
+    budget: it is not an outage but a missing inbound, so it stays due until the row goes stale instead
+    of silently evaporating once ``attempts`` reaches ``MAX_ATTEMPTS - 1``."""
     if is_flood_error(last_error):
         return flood_not_before(updated_at, last_error)
     text = str(last_error or "").strip().lower()
@@ -163,6 +219,14 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
     if classify_dead_error(text):
         return None
     spent = int(attempts or 0)
+    if is_stale_session_error(text):
+        # 2026-10-13: 原来是"无上限立即重试" —— 实测重试 62 轮跨 9 小时不收敛,
+        # 且每轮都占着 queued-lane, 堵死了老板的新 inbound (今天就是这个故障现象)。
+        # 改成有界: 走标准 backoff, 预算 STALE_SESSION_ATTEMPTS 用完即返回 None
+        # (由 sweep 转 abandoned 留痕), 队列才能继续往下走。
+        if spent >= STALE_SESSION_ATTEMPTS:
+            return None
+        return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[min(spent, len(_RETRY_BACKOFF_SECONDS) - 1)]
     if spent >= MAX_ATTEMPTS - 1:
         return None
     return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[spent]
@@ -399,7 +463,15 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            # 2026-10-13 修正: iLink stale-session 原为"无上限重投"(实测 62 轮不收敛, 且堵死
+            # queued-lane 使老板新 inbound 进不了 agent)。现按 STALE_SESSION_ATTEMPTS 有界收口,
+            # 到点转 abandoned 留痕, 既不静默蒸发, 也不无限重试。
+            attempt_capped = (
+                attempts >= STALE_SESSION_ATTEMPTS
+                if is_stale_session_error(last_error)
+                else attempts >= MAX_ATTEMPTS
+            )
+            if attempt_capped or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
@@ -479,7 +551,14 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             if due is None:
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            # Same bounded stale-session budget as sweep_stale: no silent evaporation AND no
+            # infinite retry (which wedged the queued-lane on 2026-10-13).
+            attempt_capped = (
+                attempts >= STALE_SESSION_ATTEMPTS
+                if is_stale_session_error(last_error)
+                else attempts >= MAX_ATTEMPTS
+            )
+            if attempt_capped or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=?
@@ -525,7 +604,14 @@ def pending_retries(now: Optional[float] = None) -> list[dict[str, Any]]:
         if is_reconnect_only(last_error):
             continue
         due = retry_not_before(updated_at, last_error, attempts)
-        if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+        # Same bounded stale-session budget: ``prepare failed`` needs the *user to re-pair*, so a
+        # peer merely messaging never recovers it. Retry a few times, then let the row go abandoned.
+        attempt_capped = (
+            attempts >= STALE_SESSION_ATTEMPTS
+            if is_stale_session_error(last_error)
+            else attempts >= MAX_ATTEMPTS
+        )
+        if due is None or attempt_capped or (now - created_at) > STALE_AFTER_SECONDS:
             continue
         key = (platform, adapter_profile or "default")
         if key not in earliest or due < earliest[key]:

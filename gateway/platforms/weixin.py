@@ -721,6 +721,13 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._rate_limit_circuit_until, self._rate_limit_events = 0.0, []  # type: float, List[float]
         self._dm_policy = _extra_or_secret(extra, "dm_policy", "pairing").lower()
         self._group_policy = _extra_or_secret(extra, "group_policy", "disabled").lower()
+        # V4.0.0 (2026-10-14) instant-ack. iLink's fresh-token window is ~30s while the first real reply
+        # lands at a median of 142s (p90 24 min) — the user reads the gap as a hang and re-asks. Set
+        # ``ack_message`` to a short string (or "" to disable) under platforms.weixin.extra.
+        self._ack_enabled = _coerce_bool(_extra_or_secret(extra, "ack_enabled", ""), default=False)
+        self._ack_message = _extra_or_secret(extra, "ack_message", "")
+        self._acked_chats: set[str] = set()
+        self._ack_gate = asyncio.Lock()
         # ``extra`` wins even when falsy (an explicit empty list disables the env allowlist).
         allow_from, group_allow_from = extra.get("allow_from"), extra.get("group_allow_from")
         self._allow_from = self._coerce_list(_wx_secret("WEIXIN_ALLOWED_USERS", "") if allow_from is None else allow_from)
@@ -889,6 +896,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
             await self._token_store.set(self._account_id, sender_id, context_token)
+        # V4.0.0 (2026-10-14): a new inbound is exactly one fresh-token window — re-arm the instant ack
+        # so this turn can spend it on a 3-second "收到" instead of leaving the user in silence.
+        self._arm_ack(effective_chat_id or sender_id)
         if self._poll_session and self._token and not self._typing_cache.get(sender_id):
             asyncio.create_task(self._fetch_typing_ticket(self._poll_session, sender_id, context_token or None, "getConfig failed"))
         media_paths, media_types = [], []  # type: List[str], List[str]
@@ -987,8 +997,14 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         errmsg = resp.get("errmsg") or resp.get("msg")
                         if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
                             retried_without_token, context_token = True, None
-                            self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
-                            logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
+                            # V4.0.0 (2026-10-14): do NOT evict the cached context_token here. The local
+                            # context_token is only a cache of the last inbound token; a -14/-2 "prepare failed"
+                            # means the SERVER rejected the token as stale, not that it is now invalid
+                            # everywhere. Evicting it made every remaining retry run tokenless (measured 85%
+                            # failure rate) instead of with the cached token (measured 26%), i.e. the code
+                            # converted a 26% failure into a near-certain loss. The next inbound message
+                            # overwrites this entry anyway, so keeping it costs nothing and only helps.
+                            logger.warning("[%s] session expired for %s; retrying without context_token (cached token kept for later turns)", self.name, _safe_id(chat_id))
                             continue
                         if _is_stale_session_ret(ret, errcode, errmsg):
                             # break, not raise: a raise here is caught below and re-enters the retry ladder.
@@ -1031,6 +1047,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
+        # V4.0.0 (2026-10-14): media delivery above can take many seconds (CDN round-trips), and a long
+        # agent turn can span minutes. Re-read the cached context_token immediately before EVERY chunk so
+        # a mid-turn inbound refresh is picked up. Measured 2026-10-14: with token 26% send failure,
+        # without 85% — and chunk #2/#3 of one turn failed 43%/61% because they reused chunk #1's snapshot.
+        # Keep the initial read above for the fast path (no inbound yet), but re-read per chunk.
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
         # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
         with self._media_delivery_scope(self.build_source(chat_id=chat_id)):
@@ -1049,7 +1070,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
+                # V4.0.0 (2026-10-14): fresh token per chunk (see note at the top of send()).
+                await self._send_text_chunk(
+                    chat_id=chat_id, chunk=chunk,
+                    context_token=self._token_store.get(self._account_id, chat_id) or context_token,
+                    client_id=client_id)
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
@@ -1079,7 +1104,50 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.debug("[%s] typing %s failed for %s: %s", self.name, label, _safe_id(chat_id), exc)
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+        """V4.0.0 (2026-10-14): iLink freshness window is ~30s, but the first real reply lands a
+        median of 142s later (p90 24 min) and its measured send failure rate climbs to 43% by the
+        2nd chunk. The user therefore sees "对方正在输入中…" and then silence, and repeats the same
+        question. ``send_typing(TYPING_START)`` is the single entry point every turn path already
+        calls (run_turn.py:2822 streaming, run_turn_runner.py:685 progress), so this is the one place
+        that buys a send attempt inside the fresh-token window without touching turn orchestration.
+
+        The ack is text, not the typing indicator, so it consumes a send attempt like any reply: the
+        Nth chunk of the same turn fails at 26%/43%/61%. That cost is deliberate — one short ack that
+        lands is worth more than a perfect answer that arrives minutes later or never.
+        """
         await self._set_typing(chat_id, TYPING_START, "start")
+        await self._maybe_send_fresh_ack(chat_id, metadata)
+
+    async def _maybe_send_fresh_ack(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+        """Best-effort instant ack. Never raises, never blocks the turn, and is skipped when the turn
+        already produced visible text (no double "收到" in front of the real answer)."""
+        try:
+            if not self._ack_enabled or not self._send_session or not self._token:
+                return
+            async with self._ack_gate:
+                if chat_id in self._acked_chats:
+                    return
+                # Only ack once per inbound: the next inbound re-arms it via _arm_ack().
+                self._acked_chats.add(chat_id)
+            content = self._ack_text()
+            if not content:
+                return
+            client_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            await self._send_text_chunk(
+                chat_id=chat_id, chunk=self.format_message(content),
+                context_token=self._token_store.get(self._account_id, chat_id),
+                client_id=client_id)
+            logger.info("[%s] fresh-window ack delivered to %s (%d chars)", self.name, _safe_id(chat_id), len(content))
+        except Exception as exc:
+            # An ack is a courtesy; any failure must fall through to the real reply path untouched.
+            logger.debug("[%s] fresh-window ack failed for %s: %s", self.name, _safe_id(chat_id), exc)
+
+    def _ack_text(self) -> str:
+        return str(self._ack_message or "").strip()
+
+    def _arm_ack(self, chat_id: str) -> None:
+        """Re-arm the ack for a new inbound message (called from the inbound handler)."""
+        self._acked_chats.discard(chat_id)
 
     async def stop_typing(self, chat_id: str) -> None:
         await self._set_typing(chat_id, TYPING_STOP, "stop")
@@ -1148,6 +1216,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not upload_url:
             raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
         encrypted_query_param = await _upload_ciphertext(self._send_session, ciphertext=ciphertext, upload_url=upload_url)
+        # V4.0.0 (2026-10-14): fetch the token immediately before each item_list send instead of once up front.
+        # A long media upload (CDN round-trips) can outlast the token's freshness window; re-reading the store
+        # here means caption+media each get the newest cached token (measured 26% vs 85% tokenless).
         context_token = self._token_store.get(self._account_id, chat_id)
         # iLink expects aes_key as base64(hex_string), not base64(raw_bytes) — otherwise images render as grey boxes.
         item_kwargs = {
@@ -1168,12 +1239,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                 if (ret is None or ret == 0) and (errcode is None or errcode == 0):
                     break
-                # Same stale-session fallback as _send_text_chunk: re-send once without context_token. Clearing the
-                # token also covers the remaining item lists (caption, then media) and bounds this loop.
+                # Same stale-session fallback as _send_text_chunk: re-send once without context_token.
+                # V4.0.0 (2026-10-14): keep the cached token for the NEXT turn — see _send_text_chunk for
+                # the measured 26%-with-token vs 85%-tokenless failure rates that make eviction harmful.
                 if _is_session_expired(resp, ret, errcode) and context_token:
                     context_token = None
-                    self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
-                    logger.warning("[%s] session expired for %s; re-sending media without context_token", self.name, _safe_id(chat_id))
+                    logger.warning("[%s] session expired for %s; re-sending media without context_token (cached token kept for later turns)", self.name, _safe_id(chat_id))
                     continue
                 errmsg = resp.get("errmsg") or resp.get("msg")
                 if _is_stale_session_ret(ret, errcode, errmsg):
