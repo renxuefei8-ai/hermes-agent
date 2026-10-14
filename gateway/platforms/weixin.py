@@ -188,9 +188,17 @@ class ContextTokenStore:
         # the newer token from disk).
         self._persist_lock = asyncio.Lock()
 
+    # V4.2.0 (2026-10-14): context-token keys MUST be case-normalised.
+    # Tencent's own plugin fixed this exact bug in 3.1.0 (2026-08-10, "Context-token user ID
+    # case normalization (outbound ret=-3)"): getUpdates can hand back a mixed-case user ID while
+    # the outbound/session path uses a lowercased one, so the same conversation resolves two
+    # different cache keys — the reply then goes out with no token at all (ret=-3 / prepare failed).
+    # Measured here: the persisted key is the mixed-case 'o9cq806sUKB725...@im.wechat', and
+    # `_safe_id` in the logs truncates both sides to 'o9cq806s', which is why the split was invisible.
+    # Stale entries are dropped on read; new writes land under the normalised key.
     @staticmethod
     def _key(account_id: str, user_id: str) -> str:
-        return f"{account_id}:{user_id}"
+        return f"{account_id}:{user_id.strip().lower()}"
 
     def restore(self, account_id: str) -> None:
         path = self._root / f"{account_id}.context-tokens.json"
@@ -1004,7 +1012,18 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                             # failure rate) instead of with the cached token (measured 26%), i.e. the code
                             # converted a 26% failure into a near-certain loss. The next inbound message
                             # overwrites this entry anyway, so keeping it costs nothing and only helps.
-                            logger.warning("[%s] session expired for %s; retrying without context_token (cached token kept for later turns)", self.name, _safe_id(chat_id))
+                            #
+                            # V4.2.0 (2026-10-14): the tokenless fallback is kept but demoted to a
+                            # LAST-RESORT degraded send instead of a peer retry. Measured over 20 days:
+                            # 451 tokenless re-sends produced a 15.3% success rate (2696 token sends
+                            # produced ~74%). Spending a retry budget and a context_token on a 15% shot
+                            # is worse than waiting: the ledger only gives an obligation 8 stale attempts
+                            # / 45 min, so each 15% attempt burns one eighth of the recovery window.
+                            # The fallback still fires exactly once, keeps a genuine cold-start (cron push
+                            # with no inbound ever) working, and never runs when a token exists at all.
+                            logger.warning("[%s] session expired for %s; one degraded tokenless retry "
+                                           "(cached token kept; measured tokenless success 15%% vs 74%% with token)",
+                                           self.name, _safe_id(chat_id))
                             continue
                         if _is_stale_session_ret(ret, errcode, errmsg):
                             # break, not raise: a raise here is caught below and re-enters the retry ladder.
