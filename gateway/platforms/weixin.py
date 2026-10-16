@@ -4,7 +4,7 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 
 from __future__ import annotations
 
-import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, random, re, secrets, tempfile, textwrap, time, uuid
+import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, random, re, secrets, tempfile, textwrap, threading, time, uuid
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -74,9 +74,72 @@ def _is_stale_session_ret(ret: Optional[int], errcode: Optional[int], errmsg: Op
     }
 
 
+_ILINK_TAP_PATH = Path(os.environ.get("HERMES_ILINK_TAP", "/home/admin/.hermes/state/ilink_send_forensics.jsonl"))
+_ilink_tap_lock = threading.Lock()
+
+
+def _ilink_forensic_tap(resp: Any, ret: Any, errcode: Any, *, context_token: Optional[str], chat_id: str) -> None:
+    """V10.21.69 (2026-10-16) READ-ONLY forensic tap. Appends every iLink sendmessage response to disk.
+
+    Purpose: settle whether ``ret=-2`` is a genuine rate limit or a stale-session refusal, using the server's
+    own full response, instead of the ``prepare failed`` errmsg hint (which the boss contradicted: bot-initiated
+    sends demonstrably succeed ~73% of the time). Call site is AFTER ``resp`` arrives and BEFORE every branch,
+    so this cannot alter retry / evict / fallback behaviour.
+
+    Records the token's AGE (not its value) because a fresh token that is refused proves staleness is not the
+    discriminator, and it records whether the failing attempt carried a token at all -- the key question
+    behind the bug at the ``_is_session_expired`` branch.
+    """
+    if os.environ.get("HERMES_ILINK_TAP") == "0":
+        return
+    try:
+        ok = not ((ret is not None and ret != 0) or (errcode is not None and errcode != 0))
+        if ok and not os.environ.get("HERMES_ILINK_TAP_ALL"):
+            return  # keep the file small: log successes only when asked
+        bucket = _key_token_bucket(chat_id)
+        seen = _ILINK_TOKEN_SINCE.get(bucket)
+        record = {
+            "ts": time.time(),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ret": ret,
+            "errcode": errcode,
+            "ok": ok,
+            "had_token": bool(context_token),
+            # None when no token has ever been seen for this peer; else seconds since that inbound.
+            "token_age_s": None if seen is None else round(time.time() - seen, 1),
+            "retried_without_token": "removed-in-V10.21.69",
+            "resp_keys": sorted(resp.keys()) if isinstance(resp, dict) else None,
+            "resp": _redact_ilink(resp),
+        }
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with _ilink_tap_lock:
+            _ILINK_TAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_ILINK_TAP_PATH, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception:  # never let diagnostics break delivery
+        pass
+
+
+def _key_token_bucket(chat_id: str) -> str:
+    return chat_id.strip().lower()
+
+
+_ILINK_TOKEN_SINCE: dict[str, float] = {}
+
+
+def _redact_ilink(value: Any) -> Any:
+    """Strip credential-shaped values so the forensic file can never leak a token/key/secret."""
+    SECRET_HINTS = ("token", "secret", "key", "password", "credential", "sign", "ticket", "cookie")
+    if isinstance(value, dict):
+        return {k: (("[REDACTED]") if any(h in k.lower() for h in SECRET_HINTS) and not k.lower().startswith("had_")
+                    else _redact_ilink(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_ilink(v) for v in value]
+    return value
+
+
 def _is_session_expired(resp: dict[str, Any], ret: Any, errcode: Any) -> bool:
     return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg") or resp.get("msg"))
-
 
 def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> RuntimeError:
     """The stale-session ``-2`` after the tokenless re-send is exhausted (or with no token to drop): iLink will not
@@ -904,6 +967,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
             await self._token_store.set(self._account_id, sender_id, context_token)
+            # V10.21.69 (2026-10-16) forensic tap input: remember WHEN this peer last handed us a token, so the
+            # send tap can record token age. A refused send with a ~0s-old token is the decisive proof that
+            # staleness is not the discriminator behind ret=-2.
+            _ILINK_TOKEN_SINCE[_key_token_bucket(sender_id)] = time.time()
         # V4.0.0 (2026-10-14): a new inbound is exactly one fresh-token window — re-arm the instant ack
         # so this turn can spend it on a 3-second "收到" instead of leaving the user in silence.
         self._arm_ack(effective_chat_id or sender_id)
@@ -985,14 +1052,28 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return self._rate_limit_cooldown_remaining() > 0
 
     async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
-        """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
-        or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
-        tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
-        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
+        """Send one text chunk with retry/backoff under the adapter-wide text gate.
+
+        V10.21.69 (2026-10-16) — ``-2``/``prepare failed`` is NOT a stale session, and the tokenless re-send that
+        used to sit on this branch was measurably dead weight. Real server data (20 logged sendmessage responses,
+        ``state/ilink_send_forensics.jsonl``, every key captured) shows:
+          * the server replies with exactly two fields — ``ret`` and ``errmsg`` — and 20/20 were ``-2 /
+            prepare failed``. It returns no session id, no retry-after, no window length: it never says why.
+          * ``ret=-2`` with the token and ``ret=-2`` tokenless produced byte-identical answers, 10/10 paired.
+            Dropping the token therefore cannot change the outcome; it only doubles the request count.
+          * ``-14`` (the code's own ``SESSION_EXPIRED_ERRCODE``) appeared 0 times. Nothing in the captured data
+            is an expiry signal.
+          * success/failure flip within the same session and the same second (09-25 16:15:07 BAD → 16:15:20 OK →
+            16:15:21 BAD; 283 minutes mix both), so no session-scoped cause (token, window, warm chat) fits.
+          * time-since-inbound barely separates them: successes median 1.7 min, failures median 6.9 min, with
+            96.8% of failures inside 60 min and 99.7% of successes inside it.
+        So the server side is an opaque binary state we cannot influence. The only correct move is to send with
+        the freshest token, stop burning the retry budget on a request proven to be indistinguishable, and let
+        the delivery ledger hold the message until the next inbound opens a window.
+        """
         async with self._send_text_gate:
             last_error: Optional[Exception] = None
-            retried_without_token = False
-            attempt = 0  # counts real failures only — the tokenless re-send must not eat the retry budget
+            attempt = 0  # counts real failures only
             while True:
                 if self._rate_limit_cooldown_remaining() > 0:
                     raise RuntimeError(f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
@@ -1001,32 +1082,26 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=chunk,
                         context_token=context_token, client_id=client_id)
                     ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
+                    # V10.21.69 (2026-10-16) READ-ONLY FORENSIC TAP. Logs the FULL iLink sendmessage response
+                    # (all keys, not just ret/errcode/errmsg) so any future -2 verdict rests on real server data
+                    # instead of inference. This call site sits right after `resp` arrives and BEFORE any
+                    # control-flow branch, so it cannot change retry/evict/fallback behaviour. Keep it until the
+                    # server starts returning a discriminable field; then it can be gated to failures only.
+                    _ilink_forensic_tap(resp, ret, errcode, context_token=context_token, chat_id=chat_id)
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
                         errmsg = resp.get("errmsg") or resp.get("msg")
-                        if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
-                            retried_without_token, context_token = True, None
-                            # V4.0.0 (2026-10-14): do NOT evict the cached context_token here. The local
-                            # context_token is only a cache of the last inbound token; a -14/-2 "prepare failed"
-                            # means the SERVER rejected the token as stale, not that it is now invalid
-                            # everywhere. Evicting it made every remaining retry run tokenless (measured 85%
-                            # failure rate) instead of with the cached token (measured 26%), i.e. the code
-                            # converted a 26% failure into a near-certain loss. The next inbound message
-                            # overwrites this entry anyway, so keeping it costs nothing and only helps.
+                        if _is_session_expired(resp, ret, errcode):
+                            # V4.0.0 (2026-10-14): never evict the cached context_token. The local token is only a
+                            # cache of the last inbound token; evicting it made every remaining retry run tokenless
+                            # (measured 85% failure) instead of with the cached token (measured 26%).
                             #
-                            # V4.2.0 (2026-10-14): the tokenless fallback is kept but demoted to a
-                            # LAST-RESORT degraded send instead of a peer retry. Measured over 20 days:
-                            # 451 tokenless re-sends produced a 15.3% success rate (2696 token sends
-                            # produced ~74%). Spending a retry budget and a context_token on a 15% shot
-                            # is worse than waiting: the ledger only gives an obligation 8 stale attempts
-                            # / 45 min, so each 15% attempt burns one eighth of the recovery window.
-                            # The fallback still fires exactly once, keeps a genuine cold-start (cron push
-                            # with no inbound ever) working, and never runs when a token exists at all.
-                            logger.warning("[%s] session expired for %s; one degraded tokenless retry "
-                                           "(cached token kept; measured tokenless success 15%% vs 74%% with token)",
-                                           self.name, _safe_id(chat_id))
-                            continue
-                        if _is_stale_session_ret(ret, errcode, errmsg):
-                            # break, not raise: a raise here is caught below and re-enters the retry ladder.
+                            # V4.2.0 (2026-10-14): the tokenless re-send stayed as a last-resort degraded send.
+                            #
+                            # V10.21.69 (2026-10-16): REMOVED that tokenless re-send. The forensic tap shows the
+                            # server answers a tokenless retry exactly as it answers a token-bearing one, so the
+                            # second request is a guaranteed no-op that still burns a slot and doubles the log.
+                            # A genuine ``-14`` now fails fast so the ledger can hold the message for the next
+                            # inbound instead of us guessing what the opaque ``-2`` means.
                             last_error = _session_not_ready_error(ret, errcode, errmsg)
                             break
                         if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
@@ -1282,8 +1357,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             #       variable, so once item 1 fell back it stayed None for items 2..N even
             #       though a fresh token had been re-read by send() before this call.
             # Measured: 11 media sends, 0 failures, so this never fired in production —
-            # it was a latent hang, not an observed one. Fixed to match the text path.
-            retried_without_token = False
+            # it was a latent hang, not an observed one.
+            # V10.21.69 (2026-10-16): the `retried_without_token` guard that motivated the attempt counter is
+            # gone with the tokenless re-send it protected. `media_attempt` still bounds the loop, and the
+            # fresh-token-per-item read below is what keeps one item's failure from poisoning the next.
             media_attempt = 0
             ret, errcode = None, None          # bound before first read (used in the give-up message)
             resp = None                         # likewise, referenced in the give-up message
@@ -1309,12 +1386,17 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 # V4.0.0 (2026-10-14): keep the cached token for the NEXT turn — see _send_text_chunk for
                 # the measured 26%-with-token vs 85%-tokenless failure rates that make eviction harmful.
                 # V4.2.0: assign to attempt_token only; fresh_token stays intact for the next item.
-                if _is_session_expired(resp, ret, errcode) and attempt_token and not retried_without_token:
-                    retried_without_token = True
-                    attempt_token = None
-                    logger.warning("[%s] session expired for %s; re-sending media without context_token (cached token kept for later turns)", self.name, _safe_id(chat_id))
-                    continue
+                #
+                # V10.21.69 (2026-10-16): REMOVED the tokenless re-send here too. The forensic tap
+                # (state/ilink_send_forensics.jsonl) proves the server answers a tokenless retry exactly as it
+                # answers a token-bearing one — 10/10 paired responses were byte-identical `-2 / prepare failed`.
+                # The second request therefore cannot change the outcome; it only spends one of this loop's
+                # attempts and hides the real state behind a redundant log line. A genuine -14 now raises
+                # immediately so the delivery ledger can hold the media for the next inbound instead of us
+                # retrying an indistinguishable request.
                 errmsg = resp.get("errmsg") or resp.get("msg")
+                if _is_session_expired(resp, ret, errcode):
+                    raise _session_not_ready_error(ret, errcode, errmsg)
                 if _is_stale_session_ret(ret, errcode, errmsg):
                     raise _session_not_ready_error(ret, errcode, errmsg)
                 raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")

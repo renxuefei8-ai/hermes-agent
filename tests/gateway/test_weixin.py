@@ -280,24 +280,38 @@ class TestWeixinChunkDelivery:
 
     @pytest.mark.parametrize("error_field", ["ret", "errcode"])
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
-    def test_prepare_failed_retries_without_context_token(self, send_message_mock, error_field):
+    def test_prepare_failed_fails_fast_without_dropping_the_token(self, send_message_mock, error_field):
+        """V10.21.69: a ``-2 prepare failed`` must NOT trigger a tokenless re-send.
+
+        Real server data (``state/ilink_send_forensics.jsonl``, 20 captured responses) shows iLink answers a
+        tokenless request exactly as it answers a token-bearing one — 10/10 paired responses were byte-identical
+        ``-2 / prepare failed``. Re-sending without the token therefore cannot change the outcome; it only burns
+        a retry slot and doubles the log. The contract now is: one attempt, keep the cached token, hand the
+        message to the delivery ledger so the next inbound gets a clean window.
+        """
         adapter = self._connected_adapter()
         adapter._rate_limit_circuit_threshold = 1
         adapter._token_store._cache[adapter._token_store._key(adapter._account_id, "wxid_test123")] = "ctx-token"
         prepare_failed = {error_field: weixin.RATE_LIMIT_ERRCODE, "errmsg": "prepare failed"}
-        send_message_mock.side_effect = [prepare_failed, {"ret": 0}]
+        send_message_mock.return_value = prepare_failed
 
         result = asyncio.run(adapter.send("wxid_test123", "hello"))
 
-        assert result.success is True
-        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == ["ctx-token", None]
-        assert adapter._rate_limit_circuit_until == 0.0
+        assert result.success is False
+        # Exactly one request, and it carried the cached token.
+        assert send_message_mock.await_count == 1
+        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == ["ctx-token"]
+        # The token survives the failure — eviction is what turned 26% failures into near-certain loss.
+        assert adapter._token_store._cache[adapter._token_store._key(adapter._account_id, "wxid_test123")] == "ctx-token"
 
     @pytest.mark.parametrize("stored_token", [None, "ctx-token"])
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_prepare_failed_without_recovery_is_not_a_rate_limit(self, send_message_mock, stored_token):
-        """No token to drop (fresh pairing, #80125) or a tokenless re-send that still fails: the error names the
-        real cause and the rate-limit breaker stays closed, instead of "rate limited; cooldown active" for 30s."""
+        """No token to drop (fresh pairing, #80125) or a persistent failure: the error names the real cause and
+        the rate-limit breaker stays closed, instead of "rate limited; cooldown active" for 30s.
+
+        V10.21.69: the tokenless re-send is gone, so a stored token now yields the same single request as no token.
+        """
         from gateway.platforms.base import classify_send_error
 
         adapter = self._connected_adapter(context_token=stored_token)
@@ -311,28 +325,35 @@ class TestWeixinChunkDelivery:
         # The platform-neutral classifier must not route it back into the rate-limited redelivery lane either.
         assert classify_send_error(None, result.error or "") != "rate_limited"
         assert adapter._rate_limit_cooldown_remaining() == 0.0
-        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == (
-            [None] if stored_token is None else ["ctx-token", None])
+        assert send_message_mock.await_count == 1
+        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == [stored_token]
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
-    def test_tokenless_resend_does_not_consume_retry_budget(self, send_message_mock):
-        """With ``send_chunk_retries=0`` the stale-session re-send must still happen: it is a different payload,
-        not a failed attempt, so it must not eat the (only) retry slot and fall out of the loop (#112709)."""
+    def test_session_expired_ret_fails_fast_and_keeps_the_token(self, send_message_mock):
+        """A genuine ``-14`` (iLink's real session-expired code, which appeared 0 times in captured data) fails fast
+        so the delivery ledger can hold the message for the next inbound. It must not be laundered into a tokenless
+        resend (#112709) — that fix assumed -2 was stale-session, which V10.21.69 disproved."""
         adapter = self._connected_adapter()
         adapter._send_chunk_retries = 0
-        send_message_mock.side_effect = [{"ret": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "session expired"}, {"ret": 0}]
+        adapter._token_store._cache[adapter._token_store._key(adapter._account_id, "wxid_test123")] = "ctx-token"
+        send_message_mock.return_value = {"ret": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "session expired"}
 
         result = asyncio.run(adapter.send("wxid_test123", "hello"))
 
-        assert result.success is True
-        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == ["ctx-token", None]
+        assert result.success is False
+        assert send_message_mock.await_count == 1
+        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == ["ctx-token"]
+        assert adapter._token_store._cache[adapter._token_store._key(adapter._account_id, "wxid_test123")] == "ctx-token"
 
     @patch.object(weixin, "_send_items", new_callable=AsyncMock)
     @patch.object(weixin, "_upload_ciphertext", new=AsyncMock(return_value="enc-q"))
     @patch.object(weixin, "_get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://cdn.example.com/upload"}))
-    def test_media_send_reads_ret_and_resends_without_token_on_stale_session(self, send_items_mock, tmp_path):
-        """The media leg (cron media_files / send_document) must honour iLink ret like _send_text_chunk: a stale-token
-        ``ret=-2 prepare failed`` gets one tokenless re-send, and a persistent error is a failure, not success (#112709)."""
+    def test_media_send_fails_fast_on_prepare_failed_without_dropping_the_token(self, send_items_mock, tmp_path):
+        """V10.21.69: the media leg honours iLink ret the same way the text leg now does.
+
+        A ``-2 prepare failed`` raises on the first response instead of re-sending tokenless; a persistent error is
+        still a failure, not success (#112709), and the cached token survives for the next turn.
+        """
         adapter = self._connected_adapter()
         doc = tmp_path / "report.pdf"
         doc.write_bytes(b"%PDF-1.4")
@@ -342,7 +363,8 @@ class TestWeixinChunkDelivery:
 
         assert result.success is False
         assert "session not ready" in (result.error or "") and "prepare failed" in (result.error or "")
-        assert [call.kwargs["context_token"] for call in send_items_mock.await_args_list] == ["ctx-token", None]
+        assert send_items_mock.await_count == 1
+        assert [call.kwargs["context_token"] for call in send_items_mock.await_args_list] == ["ctx-token"]
 
 
 class TestWeixinOutboundMedia:
