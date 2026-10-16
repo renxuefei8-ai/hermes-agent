@@ -9,6 +9,7 @@ Shared helpers are reached via the late-binding seam in :mod:`hermes_cli.web_dep
 so a test's ``monkeypatch.setattr(<owning module>, "_helper", ...)`` keeps working.
 """
 
+import asyncio
 import contextlib
 import copy
 import functools
@@ -120,7 +121,8 @@ def _scope_profile_name(path: Path) -> Optional[str]:
     return path.name
 
 
-def _write_profile_model(profile_dir: Path, provider: str, model: str, validate_in: Optional[Path] = None) -> None:
+def _write_profile_model(profile_dir: Path, provider: str, model: str, validate_in: Optional[Path] = None,
+                         base_url: str = "") -> None:
     """Write the main model assignment into ``profile_dir``'s config.yaml (HERMES_HOME-scoped)
     through the same validated /model shape as ``POST /api/model/set``.
 
@@ -132,11 +134,14 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str, validate_
     Both spans enter ``_config_profile_scope`` (home + secret scope), matching ``/api/model/set``:
     once the dashboard has served a secondary profile, ``switch_model``'s ``key_env`` probe goes
     through ``get_secret``, which fails closed without a scope and reports the provider as
-    unconnected (UnscopedSecretError class, #114676)."""
+    unconnected (UnscopedSecretError class, #114676).
+
+    ``base_url`` is the endpoint a bare ``custom``/``local`` pick binds to (a fresh profile's config
+    names none); other providers ignore it."""
     from hermes_cli.config import load_config, save_config
     with _config_profile_scope(_scope_profile_name(validate_in or profile_dir)):
         provider, model = _normalize_main_model_assignment(provider, model)
-        result = _validated_main_model_selection(load_config(), provider, model)
+        result = _validated_main_model_selection(load_config(), provider, model, base_url)
     with _config_profile_scope(_scope_profile_name(profile_dir)), _CONFIG_MUTATION_LOCK:  # RMW span
         cfg = load_config()
         cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), result)
@@ -939,16 +944,16 @@ async def open_profile_terminal_endpoint(name: str):
         command = _profile_setup_command(name)
 
         if sys.platform.startswith("win"):
-            subprocess.Popen(["cmd.exe", "/c", "start", "", command])
+            subprocess.Popen(["cmd.exe", "/c", "start", "", command])  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
         elif sys.platform == "darwin":
             escaped = command.replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.Popen(["osascript", "-e",
+            subprocess.Popen(["osascript", "-e",  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
                               f'tell application "Terminal"\nactivate\ndo script "{escaped}"\nend tell'])
         else:
             for executable, popen_args in _linux_terminal_commands(command):
-                if subprocess.call(["which", executable], stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL) == 0:
-                    subprocess.Popen(popen_args)
+                if await asyncio.to_thread(subprocess.call, ["which", executable], stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL) == 0:
+                    subprocess.Popen(popen_args)  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
                     break
             else:
                 raise HTTPException(status_code=400, detail="No supported terminal emulator found")

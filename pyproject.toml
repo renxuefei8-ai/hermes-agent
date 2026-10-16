@@ -401,7 +401,7 @@ pty = []
 # module names.
 mcp = [
   "mcp==2.0.0",
-  "httpx2==2.7.0",
+  "httpx2==2.12.0",
   "starlette==1.3.1",
 ] # starlette: CVE-2026-48710
 # Backwards-compatible no-op alias. Relay is a core dependency on supported
@@ -416,7 +416,7 @@ teams = [
 # provides the MCP client, independently of the native driver package.
 computer-use = [
   "mcp==2.0.0",
-  "httpx2==2.7.0",
+  "httpx2==2.12.0",
   "starlette==1.3.1",
 ] # starlette: CVE-2026-48710
 acp = ["agent-client-protocol==0.9.0"]
@@ -437,7 +437,6 @@ otlp = [
   "opentelemetry-sdk==1.39.1",
   "opentelemetry-exporter-otlp-proto-http==1.39.1",
 ]
-langfuse = ["langfuse==4.15.2"]
 bedrock = ["boto3==1.42.89"]
 vertex = ["google-auth==2.55.1"]
 azure-identity = ["azure-identity==1.25.3"]
@@ -539,7 +538,7 @@ dev = [
   "pytest==9.1.1",
   "pytest-asyncio==1.3.0",
   "mcp==2.0.0",
-  "httpx2==2.7.0",
+  "httpx2==2.12.0",
   "starlette==1.3.1",
   "ty==0.0.82",
   "ruff==0.15.10",
@@ -631,59 +630,20 @@ override-dependencies = [
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
 ]
-exclude-newer = "14 days"
-# h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
-# request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
-# aiohttp, cryptography: same shape — the advisory fixes are newer than the
-# 14-day window, so the resolver cannot see them without an exception.
-#
-# defusedxml, python-olm, unpaddedbase64: the OPPOSITE shape (#80387, #79434,
-# #78227 family). These are ancient, effectively frozen releases (2021-2023)
-# whose upload dates are frequently absent from mirror indexes and stale uv
-# HTTP caches. uv treats a missing upload date as "newer than the cutoff" and
-# excludes the package, bricking [youtube]/[wecom]/[matrix] resolution
-# ("there are no versions of defusedxml"). Exempting them carries zero aging
-# risk — their newest releases are years old — and unbricks resolvers that
-# cannot see upload dates.
-#
-# setuptools, wheel, pillow, mcp: build/core pin bricks (#78227, #75992, #76020, #96488). uv
-# applies exclude-newer to build-system.requires and core deps too; when a
-# resolver cannot see an upload date (old uv, mirror index, stale HTTP cache)
-# it filters the pinned version and the package cannot even BUILD
-# ("No solution found when resolving: setuptools==83.0.0"). These deps are
-# exact-pinned (==X.Y.Z), so exclude-newer adds zero float protection for
-# them — the version cannot move without a reviewed pin bump — while the
-# cutoff can still brick installs. Exempting exact pins is pure brick-risk
-# removal at no supply-chain cost. Guarded by
-# tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-#
-# firecrawl-anydoc: same exact-pin shape (==0.2.4, hosted-OCR wiring PR).
-# The pin bump WAS the review; exclude-newer adds zero float protection to
-# an exact pin and would only delay the reviewed version 14 days.
-#
-# Every other exact-pinned package below: the release-day brick shape
-# (observed 2026-08-29 updating three long-running installs v0.20.0 ->
-# v0.20.6 — one Termux, two Linux servers). Each release exact-pins at least
-# one dependency to a version published days before the release (v0.20.6
-# pinned snowballstemmer==3.1.1 and psutil==7.2.2 in core, plus fastapi /
-# uvicorn / python-telegram-bot pins across extras). For two weeks after
-# release the cutoff filters those versions out, so any venv that predates
-# the release bricks on `hermes update` ("no version of
-# snowballstemmer==3.1.1") until the window passes. Same zero-float-
-# protection logic as setuptools/pillow/mcp above; enforced for every exact
-# pin by
-# tests/test_packaging_metadata.py::test_exact_pinned_deps_exempt_from_exclude_newer.
-#
-# maturin, setuptools-rust: build-system.requires of the cryptography pin
-# above. cryptography itself is exempted, but on wheel-less platforms
-# (Termux/Android) it must build from sdist, and the isolated build
-# environment resolves under the same cutoff ("Failed to resolve
-# requirements from build-system.requires ... maturin>=1.9,<2").
-#
-# google-cloud-pubsub: same exact-pin shape (==2.39.2, google-chat adapter).
-# The pin bump WAS the review; exclude-newer only filters it because the
-# 14-day window is younger than the reviewed release.
-
+# Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
+# locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
+# check), never on users' machines: PM installs from this vetted lock and drops the
+# cutoff from what it generates (pm/workspace.py::_trust_core_lock), because many
+# package mirrors publish no upload times and uv rejects a file it cannot date
+# (#135589). Exact pins follow the same 3-day rule; there are no exemptions.
+exclude-newer = "3 days"
+# 本机豁免保留 (V2026-10-17 升级 v0.22.2 时复核):
+#   上游 v0.22.2 把窗口从 14 天收紧到 3 天并删掉全部豁免, 理由是 PM 装用户机时
+#   会主动丢掉 cutoff (pm/workspace.py::_trust_core_lock)。本机走阿里云镜像,
+#   多数包缺 upload_time, uv 把"缺时间"当"比 cutoff 新"直接排除该版本 →
+#   uv lock exit 1 → pm/plugin_eviction._trial 判定依赖装不上 → 自动写进
+#   plugins.disabled 并清空 memory.provider (V2026-10-10 实测事故)。
+#   故: 窗口跟上游 3 天 (供应链口径不落后), 豁免表按本机镜像实况保留。
 [tool.uv.exclude-newer-package]
 addict = false
 agent-client-protocol = false
