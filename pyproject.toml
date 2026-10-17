@@ -652,15 +652,22 @@ aiohttp-socks = false
 aiosqlite = false
 alibabacloud-dingtalk = false
 anthropic = false
+annotated-doc = false
+annotated-types = false
+anyio = false
 asyncpg = false
 azure-identity = false
+backoff = false
 boto3 = false
 brotlicffi = false
 browser-harness = false
 cdp-use = false
+cffi = false
 certifi = false
+charset-normalizer = false
 concurrent-log-handler = false
 croniter = false
+distro = false
 cryptography = false
 cuda-bindings = false
 daytona = false
@@ -699,14 +706,21 @@ google-auth = false
 google-auth-httplib2 = false
 google-auth-oauthlib = false
 google-cloud-pubsub = false
+greenlet = false
+grpcio = false
 h2 = false
+h11 = false
 httpcore2 = false
+httpcore = false
 httplib2 = false
 httptools = false
 httpx = false
 httpx2 = false
 huggingface_hub = false
+idna = false
+importlib-metadata = false
 jinja2 = false
+jiter = false
 langfuse = false
 lark-oapi = false
 markdown = false
@@ -737,7 +751,22 @@ pilk = false
 pillow = false
 pillow-heif = false
 pip = false
+# V2026-10-10: mem0ai 2.0.10 的 5 个运行时依赖缺豁免 -> uv lock exit 1 ->
+# pm/plugin_eviction._trial 判定 mem0 装不上 -> 自动写进 plugins.disabled 并清空
+# memory.provider (本次升级复核实证: memory.provider mem0 -> '' 全 3 层被清)。
+# 报错原文: "there are no versions of python-dateutil and your workspace requires
+# hermes-agent[daytona]" (python-dateutil 是 mem0ai 传递依赖)。
+# 实证: 5 个包生产 venv 里全部已装且 import 正常 (posthog 7.31.0 /
+# protobuf 6.33.5 / pytz 2025.2 / qdrant-client 1.18.0 / sqlalchemy 2.0.51),
+# 即同 resvg-py 形状 = 阿里云镜像索引 upload_time 缺失, 不是缺轮子。
+# 照 defusedxml/firecrawl-anydoc 先例豁免。
 piper-tts = false
+posthog = false
+protobuf = false
+python-dateutil = false
+pytz = false
+qdrant-client = false
+sqlalchemy = false
 playwright = false
 portalocker = false
 prompt-toolkit = false
@@ -756,6 +785,7 @@ python-dotenv = false
 python-multipart = false
 python-olm = false
 python-telegram-bot = false
+pycparser = false
 pywin32 = false
 pywinpty = false
 pyyaml = false
@@ -769,6 +799,7 @@ ruff = false
 sentencepiece = false
 setuptools = false
 setuptools-rust = false
+sniffio = false
 spacy = false
 spacy-curated-transformers = false
 tomli-w = false

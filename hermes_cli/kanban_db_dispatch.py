@@ -1807,11 +1807,24 @@ def review_dispatch_enabled() -> bool:
 
 # Assumed per-worker footprint for the derived cap; deliberately conservative
 # so the cap errs toward fewer workers on small VMs.
-MEMORY_GUARD_MB_PER_WORKER = 512
+# V2026-10-12 治本 (老板"彻查到底"拍板, gateway-shutdown-diag.log 实证):
+#   512MB 假设严重低估真实占用。三次 OOM 被内核杀的进程 (PID 1532201/1532643/1533035)
+#   实测 anon-rss 5.3~5.5GB, 是 512 假设的 10 倍。
+#   已证实的部分: oom-kill 记录 task_memcg=/system.slice/hermes-gateway.service,
+#   即被杀者是 **gateway 服务内的子进程**, 与 kanban 派发同属该 cgroup 内存池。
+#   未证实的部分: 那个子进程当时具体在跑什么命令 (/proc 已随进程消失, 无 cmdline 可取)。
+#   已排除: 被杀进程不是 wiki_graph_weighted.py —— 该脚本含新旧两版实测峰值仅 ~310MB。
+#   故 512→6144MB 的依据是**容量模型失真** (按 512 算会让派发器在 7.4GB 机器上
+#   反复派发多个 GB 级子进程), 而不是"已证明某个 kanban worker 吃了 5.4GB"。
+#   改为 6144MB (5.4GB 实测 + 1GB 余量), 使 7.4GB 小机器推导出 max_in_progress=1。
+MEMORY_GUARD_MB_PER_WORKER = 6144
 
-# Derived default bounds: never below 2 (smallest VM must still progress),
-# never above 8 (more fan-out must be explicit in config).
-DERIVED_MAX_IN_PROGRESS_FLOOR = 2
+# Derived default bounds: never below 1 on memory-tight VMs (2 × 6144MB exceeds
+# a 7.4GB box and guarantees an OOM), never above 8 (more fan-out must be
+# explicit in config).
+# V2026-10-12: FLOOR 由 2 降为 1 —— 只抬 MEMORY_GUARD 无效, 因为
+# clamp(7462/6144=1, FLOOR=2, ...) 会被 FLOOR 钳回 2, 两个 worker 共 10.8GB 仍必爆。
+DERIVED_MAX_IN_PROGRESS_FLOOR = 1
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
 
