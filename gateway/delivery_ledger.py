@@ -325,17 +325,53 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         return True
 
 
+def normalize_content(content: Optional[str]) -> str:
+    """The answer as the ledger compares it: no redelivery marker, no surrounding whitespace.
+
+    The markers are presentation added when a reply is sent AGAIN, not part of the answer. So the
+    same answer must compare equal whether it was stored plainly, with a recovered marker, or as a
+    plain-text downgrade. Without this, one answer recorded twice becomes two ledger rows and is
+    delivered twice."""
+    text = str(content or "")
+    for marker in (RECOVERED_MARKER, RECONNECTED_MARKER, FLOOD_MARKER):
+        if text.startswith(marker):
+            text = text[len(marker):]
+            break
+    return text.strip()
+
+
+def content_digest(content: Optional[str]) -> str:
+    """Stable digest of the answer itself, free of any delivery marker."""
+    return hashlib.sha256(
+        normalize_content(content).encode("utf-8", "replace")
+    ).hexdigest()[:24]
+
+
 def compute_obligation_id(session_key: str, message_ref: str, content: str) -> str:
     """Stable id: same turn + same content re-records idempotently, while distinct threads/topics on one
-    chat never collide (session_key carries platform/chat/thread; ``message_ref`` = inbound message id)."""
-    return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
+    chat never collide (session_key carries platform/chat/thread; ``message_ref`` = inbound message id).
+
+    The content is normalised first, so a delivery marker (presentation on a redelivery) cannot make
+    the same answer look like a different one and become a second obligation."""
+    return hashlib.sha256(
+        f"{session_key}|{message_ref}|{normalize_content(content)}".encode("utf-8", "replace")
+    ).hexdigest()[:24]
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+    """Record a final response as owed to the platform (state='pending').
+
+    An obligation that was already DELIVERED is never resurrected: the answer reached the
+    platform, so re-recording it (the redelivery path recording the same answer again) must not
+    turn it back into 'pending' and send the same answer a second time."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        existing = conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)
+        ).fetchone()
+        if existing is not None and existing[0] == "delivered":
+            return  # already delivered: never send this answer again
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
@@ -355,9 +391,24 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    since *since* (the turn start), and idempotent across boots that die before their sweep.
+
+    The "not already ledgered" guard compares the NORMALISED answer: a recovered marker is
+    presentation on the same answer, so a marker variant must not slip past the guard and become
+    a second row for one answer."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        exact = conn.execute(
+            """SELECT 1 FROM delivery_obligations
+               WHERE session_key = ? AND content = ? AND created_at >= ? LIMIT 1""",
+            (session_key, content, since)).fetchone()
+        if exact is None:
+            siblings = conn.execute(
+                """SELECT content FROM delivery_obligations
+                   WHERE session_key = ? AND created_at >= ?""", (session_key, since)).fetchall()
+            wanted = normalize_content(content)
+            if any(normalize_content(row[0]) == wanted for row in siblings):
+                return
         conn.execute(
             """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
@@ -461,8 +512,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
-            if _owner_alive(owner_pid, owner_started_at):
-                continue  # a live gateway still owns this row
+            owner_alive = _owner_alive(owner_pid, owner_started_at)
+            # PID reuse: only THIS process instance's own stamp counts as "self". A dead process's
+            # row can carry our PID with a NULL start time, and that must not be treated as ours.
+            owner_is_self = (
+                owner_pid == pid and started is not None and owner_started_at == started
+            )
             # 2026-10-13 修正: iLink stale-session 原为"无上限重投"(实测 62 轮不收敛, 且堵死
             # queued-lane 使老板新 inbound 进不了 agent)。现按 STALE_SESSION_ATTEMPTS 有界收口,
             # 到点转 abandoned 留痕, 既不静默蒸发, 也不无限重试。
@@ -471,7 +526,21 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 if is_stale_session_error(last_error)
                 else attempts >= MAX_ATTEMPTS
             )
-            if attempt_capped or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            exhausted = attempt_capped or (now - created_at) > STALE_AFTER_SECONDS
+            if state == "failed" and exhausted and (owner_is_self or not owner_alive):
+                # A 'failed' row has no delivery in flight, so the live-owner guard must not block
+                # its verdict: when the owner is THIS process the guard skipped the row forever (the
+                # owner is alive by definition), so the bounded stale budget spun with no verdict —
+                # 2026-10-20 实测 6 行 attempts=8 卡在 failed, 从不转 abandoned, 只能等重投.
+                # A row another LIVE process owns is still left alone: it is that owner's work.
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?
+                       WHERE obligation_id=? AND state='failed'""", (now, oid))
+                continue
+            if owner_alive:
+                continue  # a live gateway still owns this row
+            if exhausted:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
