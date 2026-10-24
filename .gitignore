@@ -325,3 +325,6 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+
+# 2026-10-18: 升级/改配置前的本地备份, 不进版本库 (hermes-agent)
+*.bak.*
