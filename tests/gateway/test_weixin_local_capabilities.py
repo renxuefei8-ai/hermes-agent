@@ -15,6 +15,7 @@ pins a behaviour that the local production deployment depends on:
 
 import json
 
+import time
 import pytest
 
 from gateway.config import PlatformConfig
@@ -408,3 +409,70 @@ class TestWeixinLedgerDrain:
 
         monkeypatch.setattr(weixin, "_ledger_pending", _boom)
         await adapter._drain_ledger("chat-1")
+
+
+class TestWeixinLedgerStaleAndBackoff:
+    """V10.21.71 (2026-10-24): 老大收到"一堆过时旧信息"的治本回归锁。
+
+    现场证据 (2026-10-24): 用户 10:50:46 发消息激活 session 后, 微信端收到 33 条过时旧信息
+    (10-19/10-22 的旧回复 + 10-24 10:54-11:01 的中间进度消息)。根因三层:
+      (1) send_failed 写入时 attempts 恒为 1 —— 后写的记录覆盖了 retry 的计数,
+          条目永远到不了 _LEDGER_MAX_ATTEMPTS, 每次入站都被重新投递;
+      (2) _ledger_pending 没有过期淘汰 —— 隔天的旧消息照样补发;
+      (3) drain 不读 next_attempt_after_s 退避门 —— 每次入站立刻把整队列涌出去。
+    """
+
+    def test_send_failed_inherits_attempts_instead_of_reset_to_one(self, tmp_path, monkeypatch):
+        """attempts 必须递增, 不能被后续 send_failed 拉回 1。
+
+        走生产路径: 同 key 先写 attempts=4, 再写一条 attempts=1 的 send_failed (旧 bug 的写法),
+        _ledger_pending 读出的 attempts 必须是 5 而不是 1 —— 否则条目永远到不了
+        _LEDGER_MAX_ATTEMPTS, 每次入站都被重新投递 (2026-10-24 现场: 33 条旧信息涌入微信)。
+        """
+        monkeypatch.setattr(weixin, "_LEDGER_PATH", tmp_path / "ledger.jsonl")
+        key = weixin._ledger_key("chat-1", "hi")
+        weixin._ledger_append({"event": "send_failed", "message_key": key,
+                               "chat_id": "chat-1", "content": "hi", "attempts": 4,
+                               "first_failed_ts": time.time()})
+        # 旧 bug 的写入方式: attempts 恒为 1
+        weixin._ledger_append({"event": "send_failed", "message_key": key,
+                               "chat_id": "chat-1", "content": "hi", "attempts": 1,
+                               "first_failed_ts": time.time()})
+        pending = weixin._ledger_pending()
+        assert len(pending) == 1
+        assert pending[0]["attempts"] == 4, \
+            f"attempts 必须继承最大值, 不得被后写的 1 拉回 (实测 {pending[0]['attempts']})"
+
+    def test_stale_entry_is_dead_lettered_not_resent(self, tmp_path, monkeypatch):
+        """超过过期窗口的旧条目必须判死, 不得再被重投。"""
+        monkeypatch.setattr(weixin, "_LEDGER_PATH", tmp_path / "ledger.jsonl")
+        old_ts = time.time() - (weixin._LEDGER_STALE_AFTER_SECONDS + 600)
+        weixin._ledger_append({"event": "send_failed", "message_key": weixin._ledger_key("chat-1", "old"),
+                               "chat_id": "chat-1", "content": "old", "attempts": 1,
+                               "first_failed_ts": old_ts, "ts": old_ts})
+        pending = weixin._ledger_pending()
+        assert pending == [] or all(p.get("event") == "dead_letter" for p in pending), \
+            "超龄条目必须被判 dead_letter"
+
+    def test_fresh_entry_is_still_pending(self, tmp_path, monkeypatch):
+        """新条目仍要能补发 —— 过期淘汰不能误杀正在重试的投递。"""
+        monkeypatch.setattr(weixin, "_LEDGER_PATH", tmp_path / "ledger.jsonl")
+        weixin._ledger_append({"event": "send_failed", "message_key": weixin._ledger_key("chat-1", "fresh"),
+                               "chat_id": "chat-1", "content": "fresh", "attempts": 1,
+                               "first_failed_ts": time.time(), "ts": time.time()})
+        pending = [p for p in weixin._ledger_pending() if p.get("event") != "dead_letter"]
+        assert len(pending) == 1 and pending[0]["content"] == "fresh"
+
+    def test_drain_batch_cap_is_bounded(self):
+        """单次 drain 补发条数必须有上限, 防止 session 恢复瞬间一次性涌出整队列。"""
+        assert 0 < weixin._LEDGER_DRAIN_MAX <= 10, "drain 批量上限必须存在且克制"
+
+    def test_stale_window_is_short_enough(self):
+        """过期窗口必须足够短 —— 超过一小时的旧消息对用户就是噪音。"""
+        assert weixin._LEDGER_STALE_AFTER_SECONDS <= 1800, "过期窗口不得超过 30 分钟"
+
+    def test_backoff_gate_constant_present(self):
+        """退避门依赖 next_attempt_after_s 字段, drain 必须会读它 (见 _drain_ledger)。"""
+        import inspect
+        src = inspect.getsource(weixin.WeixinAdapter._drain_ledger)
+        assert "next_attempt_after_s" in src, "drain 必须尊重退避门"

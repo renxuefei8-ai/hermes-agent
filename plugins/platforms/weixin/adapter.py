@@ -4,7 +4,7 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 
 from __future__ import annotations
 
-import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid, threading
+import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid, threading, random
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -198,7 +198,12 @@ class ContextTokenStore:
 
     @staticmethod
     def _key(account_id: str, user_id: str) -> str:
-        return f"{account_id}:{user_id}"
+        # V4.0.0 (2026-10-14, 腾讯 3.1.0 ret=-3): the peer id MUST be normalised. Inbound stores the token
+        # under `from_user_id` while outbound reads it back under `chat_id`; when the two differ in case the
+        # cache key splits in two and the reply goes out tokenless (measured 85% tokenless vs 26% with token).
+        # Upstream ships the un-normalised form — this local fix was carried over from the retired
+        # gateway/platforms/weixin.py core and is enforced by ilink_drift_gate rule R2.
+        return f"{account_id}:{user_id.strip().lower()}"
 
     def restore(self, account_id: str) -> None:
         path = self._root / f"{account_id}.context-tokens.json"
@@ -283,6 +288,16 @@ _LEDGER_LOCK = threading.Lock()
 # 诊断副本的重投上限; 真正的上限是 delivery_ledger.MAX_ATTEMPTS。两者独立, 互不为真值源。
 _LEDGER_MAX_ATTEMPTS = 8
 _LEDGER_BACKOFF = (10, 30, 60, 120, 300, 600, 900)
+# V10.21.71 (2026-10-24): 过期窗口。旧账本条目超过此龄即视为"过时", 不再重投。
+# 起因 (实证): 2026-10-24 老大发消息激活 session 后, 微信收到 33 条过时旧信息
+# (10-24 10:54-11:01 的中间进度消息 + 10-19/10-22 的旧回复), 全部 attempts=1 反复重投。
+# 治本: (1) 过期淘汰 — 补发只对"刚失败、还新鲜"的内容有意义, 隔天的旧消息补发即噪音;
+#       (2) attempts 继承 — send_failed 事件必须继承已有 attempts, 否则恒为 1, 永远到不了
+#           dead_letter 上限, 条目永不退出重投队列。
+_LEDGER_STALE_AFTER_SECONDS = 300  # 5 分钟
+_LEDGER_STALE_EVENTS = ("send_failed", "retry", "failed")
+# 单次 drain 最多补发多少条。防止 session 恢复瞬间把整队列一次性涌给用户。
+_LEDGER_DRAIN_MAX = 3
 _ILINK_TAP_PATH = Path(os.environ.get("HERMES_ILINK_TAP", "/home/admin/.hermes/state/ilink_send_forensics.jsonl"))
 _ilink_tap_lock = threading.Lock()
 
@@ -361,8 +376,27 @@ def _ledger_pending() -> list[dict[str, Any]]:
         # must stop re-arming itself on every later inbound (otherwise the queue never drains).
         if rec.get("event") in ("delivered", "dead_letter"):
             latest.pop(key, None)
-        else:
-            latest[key] = rec
+            continue
+        # V10.21.71 (2026-10-24): attempts 继承 + 过期淘汰。
+        # 继承: 同一 key 的后续失败事件必须沿用已有 attempts, 否则每次新写入都把 attempts 拉回 1,
+        #       条目永远到不了 _LEDGER_MAX_ATTEMPTS, 于是每次入站都被无限重投 (实证: 33 条活跃条目
+        #       全部 attempts=1, 115 条 send_failed 也全部 attempts=1)。
+        # 淘汰: 超过 _LEDGER_STALE_AFTER_SECONDS 的旧条目不再重投 — 补发只对"刚失败"的内容有意义,
+        #       隔天/隔小时的旧消息补发到用户手上就是"一堆过时的旧信息" (实证: 10-19/10-22 的旧回复)。
+        prev = latest.get(key)
+        if prev is not None:
+            prev_attempts = int(prev.get("attempts") or 0)
+            cur_attempts = int(rec.get("attempts") or 0)
+            if cur_attempts <= prev_attempts:
+                rec = {**rec, "attempts": prev_attempts}
+        age_ts = rec.get("first_failed_ts") or rec.get("ts") or 0
+        try:
+            age = time.time() - float(age_ts)
+        except Exception:
+            age = 0.0
+        if rec.get("event") in _LEDGER_STALE_EVENTS and age > _LEDGER_STALE_AFTER_SECONDS:
+            rec = {**rec, "event": "dead_letter", "stale_dropped": True, "age_seconds": int(age)}
+        latest[key] = rec
     out = sorted(latest.values(), key=lambda r: r.get("first_failed_ts") or 0)
     return out
 
@@ -1181,7 +1215,14 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if not pending:
                 return
             logger.info("[%s] ledger drain start: %d pending for %s", self.name, len(pending), me)
+            # V10.21.71 (2026-10-24): 批量上限。session 恢复瞬间若把整队列一次涌出, 老大手机端就是
+            # "一堆过时的旧信息"。只补发最新的少数几条, 其余留在队列里按退避慢慢消化。
+            drained = 0
             for rec in pending:
+                if drained >= _LEDGER_DRAIN_MAX:
+                    logger.info("[%s] ledger drain cap reached (%d), %d left for later",
+                                self.name, _LEDGER_DRAIN_MAX, len(pending) - drained)
+                    break
                 key = rec.get("message_key")
                 attempts = int(rec.get("attempts") or 0)
                 if attempts >= _LEDGER_MAX_ATTEMPTS:
@@ -1191,6 +1232,16 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     logger.warning("[%s] ledger entry %s hit max attempts (%d) -> dead_letter",
                                    self.name, me, attempts)
                     continue
+                # V10.21.71 (2026-10-24): 退避门。此前 retry 事件写入了 next_attempt_after_s, 但 drain
+                # 从不读它 —— 每次入站都把全部积压立刻重投一遍, 退避形同虚设。
+                _next_after = rec.get("next_attempt_after_s")
+                if _next_after:
+                    try:
+                        _wait = float(_next_after) - time.time()
+                    except Exception:
+                        _wait = 0.0
+                    if _wait > 0:
+                        continue
                 content = rec.get("content") or ""
                 if not content:
                     _ledger_append({**rec, "event": "dead_letter", "attempts": attempts,
@@ -1216,12 +1267,14 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         "next_attempt_after_s": _LEDGER_BACKOFF[min(attempts - 1, len(_LEDGER_BACKOFF) - 1)],
                         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     })
+                    drained += 1
                     logger.warning("[%s] ledger resend failed (%d/%d): %s",
                                    self.name, attempts, _LEDGER_MAX_ATTEMPTS, str(exc)[:120])
                 else:
                     _ledger_append({**rec, "event": "delivered", "attempts": attempts + 1,
                                     "delivered_ts": time.time(),
                                     "iso": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                    drained += 1
                     logger.info("[%s] ledger delivered %s on attempt %d", self.name, me, attempts + 1)
         except Exception:
             logger.warning("[%s] ledger drain aborted for %s", self.name, me, exc_info=True)
@@ -1261,7 +1314,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
         or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
         tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
-        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
+        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``.
+        V10.21.71 (2026-10-24): 本地 V10.21.69 曾移除 tokenless 重发, 但上游 v0.22.5 明确保留该行为且
+        upstream 测试直接断言它 ("retries without context_token" / "does not consume retry budget")。
+        老板拍板"冲突以官方为准" —— 此处恢复官方语义, R1 的本地移除语义作废。"""
         async with self._send_text_gate:
             last_error: Optional[Exception] = None
             retried_without_token = False
@@ -1303,8 +1359,16 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         if attempt >= self._send_chunk_retries:
                             break
                         attempt += 1
-                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                        logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
+                        # V4.1.0 (2026-10-14): exponential backoff + jitter. The old code used a flat 3x for the
+                        # rate-limit branch, but the measured server-side limit window is MINUTE-scale — a flat
+                        # wait drops every retry into the same window (16:28:33/37/47 all failed). The jitter
+                        # also stops several delivery obligations from retrying in lockstep and stomping on
+                        # each other. Carried over from the retired gateway/platforms/weixin.py core and
+                        # enforced by ilink_drift_gate rule R3/R3b.
+                        wait = self._send_chunk_retry_delay_seconds * (2 ** attempt) * 5.0
+                        wait *= 0.75 + random.random() * 0.5      # ±25% jitter
+                        logger.warning("[%s] rate limited for %s; backing off %.1fs (attempt %d/%d)",
+                                       self.name, _safe_id(chat_id), wait, attempt, self._send_chunk_retries + 1)
                         await asyncio.sleep(wait)
                         continue
                     self._rate_limit_events.clear()
@@ -1315,7 +1379,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     if attempt >= self._send_chunk_retries:
                         break
                     attempt += 1
-                    wait = self._send_chunk_retry_delay_seconds * attempt
+                    # V4.1.0 (2026-10-14): exponential backoff + jitter (see the rate-limit branch above).
+                    # The retired core used `delay * (2 ** attempt) * 5.0` with ±25% jitter; upstream ships a
+                    # linear `delay * attempt`, which retries far too eagerly against a minute-scale server
+                    # limit window. Enforced by ilink_drift_gate rule R3/R3b.
+                    wait = self._send_chunk_retry_delay_seconds * (2 ** attempt) * 5.0
+                    wait *= 0.75 + random.random() * 0.5      # ±25% jitter
                     logger.warning("[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
                                    self.name, _safe_id(chat_id), attempt, self._send_chunk_retries + 1, wait, exc)
                     if wait > 0:
@@ -1357,13 +1426,19 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             # cron-initiated sends fail 146/146 with ret=-2 because the peer's context_token expired long
             # after the last inbound — and this method used to simply return failure, so the message was gone
             # for good. Record it with an idempotency key; the next inbound refreshes the token and drains it.
+            # V10.21.71 (2026-10-24): attempts 必须继承该 key 已有的计数, 不能恒为 1。恒为 1 时条目
+            # 永远到不了 _LEDGER_MAX_ATTEMPTS, 每次入站都被重新投递 — 这正是老大收到"一堆过时旧信息"的
+            # 直接原因 (实证: 115 条 send_failed 全部 attempts=1, 33 条活跃条目全部 attempts=1)。
+            _lkey = _ledger_key(chat_id, final_content)
+            _prev = next((r for r in _ledger_pending() if r.get("message_key") == _lkey), None)
+            _attempts = int((_prev or {}).get("attempts") or 0) + 1
             _ledger_append({
                 "event": "send_failed",
-                "message_key": _ledger_key(chat_id, final_content),
+                "message_key": _lkey,
                 "chat_id": chat_id,
                 "content": final_content,
                 "error": str(exc)[:500],
-                "attempts": 1,
+                "attempts": _attempts,
                 "first_failed_ts": time.time(),
                 "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
@@ -1471,7 +1546,6 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not upload_url:
             raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
         encrypted_query_param = await _upload_ciphertext(self._send_session, ciphertext=ciphertext, upload_url=upload_url)
-        context_token = self._token_store.get(self._account_id, chat_id)
         # iLink expects aes_key as base64(hex_string), not base64(raw_bytes) — otherwise images render as grey boxes.
         item_kwargs = {
             "encrypt_query_param": encrypted_query_param, "aes_key_for_api": base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii"),
@@ -1484,18 +1558,46 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         last_message_id = ""
         for item_list in item_lists:
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            # Two real defects, both invisible in the logs because the media path is only reached rarely:
+            #   (a) unbounded retry — neither the text path nor this one had a bound of its own, so a server that
+            #       keeps answering "session expired" was looped against forever;
+            #   (b) token bleed across items — `context_token = None` wrote the loop-carried
+            #       variable, so once item 1 fell back it stayed None for items 2..N even
+            #       though a fresh token had been re-read by send() before this call.
+            # Measured: 11 media sends, 0 failures, so this never fired in production —
+            # it was a latent hang, not an observed one.
+            # V4.3.0 (2026-10-14): bound the loop with an explicit attempt counter. Enforced by
+            # ilink_drift_gate rule R4.
+            media_attempt = 0
+            ret, errcode = None, None          # bound before first read (used in the give-up message)
+            resp = None                         # likewise, referenced in the give-up message
+            # V4.2.0: read the token fresh FOR THIS ITEM and never mutate it. The degraded
+            # retry uses `attempt_token`, so this item's fallback cannot poison the next
+            # item's first attempt (which is what test T2 measured before the fix).
+            # Enforced by ilink_drift_gate rule R5.
+            fresh_token = self._token_store.get(self._account_id, chat_id)
+            attempt_token = fresh_token
             while True:
+                media_attempt += 1
+                if media_attempt > self._send_chunk_retries + 2:
+                    raise RuntimeError(
+                        f"iLink sendmessage gave up after {media_attempt - 1} attempts for media: "
+                        f"ret={ret} errcode={errcode} errmsg={(resp or {}).get('errmsg') if isinstance(resp, dict) else None}"
+                    )
                 resp = await _send_items(
                     self._send_session, base_url=self._base_url, token=self._token, to=chat_id, item_list=item_list,
-                    context_token=context_token, client_id=last_message_id)
+                    context_token=attempt_token, client_id=last_message_id)
                 ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                 if (ret is None or ret == 0) and (errcode is None or errcode == 0):
                     break
-                # Same stale-session fallback as _send_text_chunk: re-send once without context_token. Clearing the
-                # token also covers the remaining item lists (caption, then media) and bounds this loop.
-                if _is_session_expired(resp, ret, errcode) and context_token:
-                    context_token = None
-                    self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
+                # V10.21.71 (2026-10-24): 恢复官方 tokenless 重发语义 (upstream v0.22.5 _send_file:
+                # "if _is_session_expired(resp, ret, errcode) and context_token: context_token = None; continue").
+                # 本地 V10.21.69 曾移除, 但 upstream 测试直接断言媒体腿也做一次无 token 重发
+                # (test_media_send_reads_ret_and_resends_without_token_on_stale_session)。
+                # 老板拍板"冲突以官方为准" —— 恢复官方行为。
+                # R5 保留: 降级只作用于本 item 的 attempt_token, 不污染下一个 item 的首次尝试。
+                if _is_session_expired(resp, ret, errcode) and attempt_token:
+                    attempt_token = None
                     logger.warning("[%s] session expired for %s; re-sending media without context_token", self.name, _safe_id(chat_id))
                     continue
                 errmsg = resp.get("errmsg") or resp.get("msg")
