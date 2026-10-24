@@ -59,6 +59,27 @@ _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
 assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 
+# iLink's ``prepare failed`` is not an outage but a missing inbound: the peer must re-pair before the
+# bot may push again. Left on the generic budget it either evaporated silently (the 2026-10-13
+# incident: 65 real replies judged dead while the boss was still online, one word never seen) or was
+# retried without limit (62 rounds over 9 hours, never converging, while each round held the
+# queued-lane and starved the boss's fresh inbound). So it gets its own small, bounded budget:
+# retry a few times, then let the row go ``abandoned`` — traceable, not silent, and the queue moves.
+_STALE_SESSION_RE = re.compile(
+    r"session not ready|prepare failed|the user must send the bot a message first",
+    re.IGNORECASE,
+)
+# 20 days of live data (977 sends) showed most stale-session refusals are an *expired credential*,
+# not a required re-pair: with a context_token the failure rate is 26%, without one 85%, and it rises
+# monotonically with token age (24% within 30s -> 77% after 20 minutes) — the boss's own message is
+# what refreshes the credential, one message buys one sending chance. The old 3-attempt / 20-minute
+# budget therefore killed real answers while the boss was still online; 8 attempts plus a 45-minute
+# hard wall keeps both bounds, so one undeliverable reply can never hold the lane forever.
+STALE_SESSION_ATTEMPTS = 8
+# Same content failing inside this window means it needs a human re-pair: stop immediately instead of
+# retrying every ~6 minutes.
+STALE_SESSION_GIVE_UP_SECONDS = 45 * 60
+
 # A final send the platform refused with flood control is the other transient case: a 429 means the
 # refused request was never accepted, and the platform said how long to wait. Adapters fail such sends
 # closed as ``flood_control:<seconds>`` on purpose (#91969) so that this ledger owns the wait instead of
@@ -96,6 +117,19 @@ def _raw_flood_wait(text: str) -> Optional[float]:
 def is_reconnect_only(error: Any) -> bool:
     """True for a row that only an adapter reconnect may retry (no timer, no backoff)."""
     return str(error or "").strip().lower() in _RUNTIME_RETRYABLE_ERRORS
+
+
+def is_stale_session_error(error: Any) -> bool:
+    """True for iLink's ``prepare failed`` refusal: the peer must re-pair with the bot before the
+    bot may push again. Recoverable only by the *user re-pairing* — NOT by the peer merely messaging,
+    so it gets its own small attempt budget instead of the generic one or an unlimited one."""
+    return _STALE_SESSION_RE.search(str(error or "")) is not None
+
+
+def stale_session_attempts_exhausted(attempts: int, age_seconds: float) -> bool:
+    """Bounded retry for stale-session refusals: stop at STALE_SESSION_ATTEMPTS, or earlier if the
+    row has been failing for longer than STALE_SESSION_GIVE_UP_SECONDS (needs re-pairing, not retry)."""
+    return attempts >= STALE_SESSION_ATTEMPTS or age_seconds > STALE_SESSION_GIVE_UP_SECONDS
 
 
 def is_flood_error(error: Any) -> bool:
@@ -154,7 +188,11 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
     whole-chat death is final, and any other rejection backs off by the attempts already spent — but
     never spends the LAST budgeted attempt. An unclassified outage can outlast any timer, and a row
     the timer abandoned would be lost for good; leaving one attempt keeps it recoverable by the boot
-    sweep after a restart, which is a real recovery signal."""
+    sweep after a restart, which is a real recovery signal.
+
+    iLink's ``prepare failed`` (see ``is_stale_session_error``) is the exception that keeps its whole
+    budget: it is not an outage but a missing inbound, so it stays due until the row goes stale instead
+    of silently evaporating once ``attempts`` reaches ``MAX_ATTEMPTS - 1``."""
     if is_flood_error(last_error):
         return flood_not_before(updated_at, last_error)
     text = str(last_error or "").strip().lower()
@@ -163,6 +201,13 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
     if classify_dead_error(text):
         return None
     spent = int(attempts or 0)
+    if is_stale_session_error(text):
+        # Bounded, not unbounded: retry on the standard backoff, and once the stale-session budget
+        # is spent return None so the sweep turns the row into ``abandoned`` (traceable) instead of
+        # letting it evaporate or hold the queued-lane forever.
+        if spent >= STALE_SESSION_ATTEMPTS:
+            return None
+        return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[min(spent, len(_RETRY_BACKOFF_SECONDS) - 1)]
     if spent >= MAX_ATTEMPTS - 1:
         return None
     return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[spent]
@@ -556,7 +601,14 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             if due is None:
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            # Same bounded stale-session budget as sweep_recoverable: no silent evaporation AND no
+            # infinite retry (which wedged the queued-lane on 2026-10-13).
+            attempt_capped = (
+                attempts >= STALE_SESSION_ATTEMPTS
+                if is_stale_session_error(last_error)
+                else attempts >= MAX_ATTEMPTS
+            )
+            if attempt_capped or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=?
@@ -602,7 +654,14 @@ def pending_retries(now: Optional[float] = None) -> list[dict[str, Any]]:
         if is_reconnect_only(last_error):
             continue
         due = retry_not_before(updated_at, last_error, attempts)
-        if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+        # Same bounded stale-session budget: ``prepare failed`` needs the *user to re-pair*, so a
+        # peer merely messaging never recovers it. Retry a few times, then let the row go abandoned.
+        attempt_capped = (
+            attempts >= STALE_SESSION_ATTEMPTS
+            if is_stale_session_error(last_error)
+            else attempts >= MAX_ATTEMPTS
+        )
+        if due is None or attempt_capped or (now - created_at) > STALE_AFTER_SECONDS:
             continue
         key = (platform, adapter_profile or "default")
         if key not in earliest or due < earliest[key]:
