@@ -4,7 +4,7 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 
 from __future__ import annotations
 
-import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid
+import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid, threading
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -271,6 +271,175 @@ def _guess_chat_type(message: dict[str, Any], account_id: str) -> tuple[str, str
 
 # HTTP helpers enforce timeouts via asyncio.wait_for(), not aiohttp ClientTimeout, which raises
 # "Timeout context manager should be used inside a task" under run_coroutine_threadsafe() from cron.
+
+# ---------------------------------------------------------------------------
+# Local capability block (migrated from gateway/platforms/weixin.py, V10.21.6x-7x).
+# Upstream v0.22.5 has NO equivalent for these; they are pure additions and are
+# carried over unchanged. Conflict rule: upstream behaviour wins where the two
+# overlap; these are strictly extra paths, so both stand.
+# ---------------------------------------------------------------------------
+_LEDGER_PATH = get_hermes_home() / "state" / "weixin_delivery_ledger.jsonl"
+_LEDGER_LOCK = threading.Lock()
+# 诊断副本的重投上限; 真正的上限是 delivery_ledger.MAX_ATTEMPTS。两者独立, 互不为真值源。
+_LEDGER_MAX_ATTEMPTS = 8
+_LEDGER_BACKOFF = (10, 30, 60, 120, 300, 600, 900)
+_ILINK_TAP_PATH = Path(os.environ.get("HERMES_ILINK_TAP", "/home/admin/.hermes/state/ilink_send_forensics.jsonl"))
+_ilink_tap_lock = threading.Lock()
+
+_ILINK_TRANSIENT_MARKERS = (
+    "prepare failed",
+    "session not ready",
+    "sendmessage error",
+)
+_ILINK_RATE_LIMIT_MARKERS = (
+    "rate limited",
+    "flood",
+    "too many requests",
+)
+
+
+
+def _ilink_error_kind(error_text: str) -> Optional[str]:
+    """Map an iLink send failure onto a platform-neutral ``SendResult.error_kind``.
+
+    Returning a kind here is what keeps the reply out of ``abandoned``: the durable ledger
+    only gives up on a failure it can classify as unrecoverable, and without a kind every
+    iLink rejection arrives as ``unknown`` and is burned through the attempt cap.
+    ``None`` means "no opinion" — the caller then keeps upstream's own text-based verdict,
+    so this never overrides a classification it does not understand.
+    """
+    blob = (error_text or "").lower()
+    if not blob:
+        return None
+    if any(marker in blob for marker in _ILINK_RATE_LIMIT_MARKERS):
+        return "rate_limited"
+    if any(marker in blob for marker in _ILINK_TRANSIENT_MARKERS):
+        return "transient"
+    return None
+
+
+def _ledger_key(chat_id: str, content: str) -> str:
+    """Idempotency key. Uses the peer + a content digest so the SAME message cannot be
+    inserted twice by concurrent cron writers, while two genuinely different messages
+    to the same peer never collide."""
+    return f"{chat_id}:{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _ledger_append(record: dict[str, Any]) -> None:
+    try:
+        with _LEDGER_LOCK:
+            _LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_LEDGER_PATH, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # 账本本身绝不能把发送路径搞挂
+        logger.warning("[weixin] delivery ledger append failed", exc_info=True)
+
+
+def _ledger_pending() -> list[dict[str, Any]]:
+    """Return messages still awaiting delivery (pending / scheduled), oldest first."""
+    out: list[dict[str, Any]] = []
+    try:
+        if not _LEDGER_PATH.exists():
+            return out
+        with _LEDGER_LOCK:
+            lines = _LEDGER_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return out
+    latest: dict[str, dict[str, Any]] = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        key = rec.get("message_key")
+        if not key:
+            continue
+        # Both terminal states REMOVE the key: a delivered entry must not resend, and a dead_lettered entry
+        # must stop re-arming itself on every later inbound (otherwise the queue never drains).
+        if rec.get("event") in ("delivered", "dead_letter"):
+            latest.pop(key, None)
+        else:
+            latest[key] = rec
+    out = sorted(latest.values(), key=lambda r: r.get("first_failed_ts") or 0)
+    return out
+
+
+def _ilink_forensic_tap(resp: Any, ret: Any, errcode: Any, *, context_token: Optional[str], chat_id: str) -> None:
+    """V10.21.69 (2026-10-16) READ-ONLY forensic tap. Appends every iLink sendmessage response to disk.
+
+    Purpose: settle whether ``ret=-2`` is a genuine rate limit or a stale-session refusal, using the server's
+    own full response, instead of the ``prepare failed`` errmsg hint (which the boss contradicted: bot-initiated
+    sends demonstrably succeed ~73% of the time). Call site is AFTER ``resp`` arrives and BEFORE every branch,
+    so this cannot alter retry / evict / fallback behaviour.
+
+    Records the token's AGE (not its value) because a fresh token that is refused proves staleness is not the
+    discriminator, and it records whether the failing attempt carried a token at all -- the key question
+    behind the bug at the ``_is_session_expired`` branch.
+    """
+    if os.environ.get("HERMES_ILINK_TAP") == "0":
+        return
+    try:
+        ok = not ((ret is not None and ret != 0) or (errcode is not None and errcode != 0))
+        if ok and not os.environ.get("HERMES_ILINK_TAP_ALL"):
+            return  # keep the file small: log successes only when asked
+        bucket = _key_token_bucket(chat_id)
+        seen = _ILINK_TOKEN_SINCE.get(bucket)
+        record = {
+            "ts": time.time(),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ret": ret,
+            "errcode": errcode,
+            "ok": ok,
+            "had_token": bool(context_token),
+            # None when no token has ever been seen for this peer; else seconds since that inbound.
+            "token_age_s": None if seen is None else round(time.time() - seen, 1),
+            "retried_without_token": "removed-in-V10.21.69",
+            "resp_keys": sorted(resp.keys()) if isinstance(resp, dict) else None,
+            "resp": _redact_ilink(resp),
+        }
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with _ilink_tap_lock:
+            _ILINK_TAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_ILINK_TAP_PATH, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception:  # never let diagnostics break delivery
+        pass
+
+
+def _key_token_bucket(chat_id: str) -> str:
+    return chat_id.strip().lower()
+
+
+_ILINK_TOKEN_SINCE: dict[str, float] = {}
+
+
+def _redact_ilink(value: Any) -> Any:
+    """Strip credential-shaped values so the forensic file can never leak a token/key/secret."""
+    SECRET_HINTS = ("token", "secret", "key", "password", "credential", "sign", "ticket", "cookie")
+    if isinstance(value, dict):
+        return {k: (("[REDACTED]") if any(h in k.lower() for h in SECRET_HINTS) and not k.lower().startswith("had_")
+                    else _redact_ilink(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_ilink(v) for v in value]
+    return value
+
+
+def _key_token_bucket(chat_id: str) -> str:
+    return chat_id.strip().lower()
+def _redact_ilink(value: Any) -> Any:
+    """Strip credential-shaped values so the forensic file can never leak a token/key/secret."""
+    SECRET_HINTS = ("token", "secret", "key", "password", "credential", "sign", "ticket", "cookie")
+    if isinstance(value, dict):
+        return {k: (("[REDACTED]") if any(h in k.lower() for h in SECRET_HINTS) and not k.lower().startswith("had_")
+                    else _redact_ilink(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_ilink(v) for v in value]
+    return value
+
+
 async def _api_request(
     session: aiohttp.ClientSession, method: str, *, base_url: str, endpoint: str, headers: dict[str, str], timeout_ms: int, body: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -715,6 +884,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
         self._account_id = _extra_or_secret(extra, "account_id")
+        # --- Local capability state (migrated from the old core adapter) ---
+        self._ack_enabled = _coerce_bool(_extra_or_secret(extra, "ack_enabled", ""), default=False)
+        self._ack_message = _extra_or_secret(extra, "ack_message", "")
+        self._acked_chats: set[str] = set()
+        self._ack_gate = asyncio.Lock()
+        self._ledger_draining: Optional[asyncio.Task] = None
         self._token = str(config.token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
         self._base_url = _extra_or_secret(extra, "base_url", ILINK_BASE_URL).rstrip("/")
         self._cdn_base_url = _extra_or_secret(extra, "cdn_base_url", WEIXIN_CDN_BASE_URL).rstrip("/")
@@ -897,6 +1072,19 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
             await self._token_store.set(self._account_id, sender_id, context_token)
+            # V10.21.69 (2026-10-16) forensic tap input: remember WHEN this peer last handed us a token, so the
+            # send tap can record token age. A refused send with a ~0s-old token is the decisive proof that
+            # staleness is not the discriminator behind ret=-2.
+            _ILINK_TOKEN_SINCE[_key_token_bucket(sender_id)] = time.time()
+            # V10.21.70 (2026-10-16): an inbound is the ONLY moment the peer's token is fresh, and a fresh token
+            # is the only thing this server will accept. Drain whatever the earlier tokenless window could not
+            # deliver (cron alerts, deferred reports) right now, before the agent turn spends the window on its
+            # own reply. Fire-and-forget with its own dedupe so a burst of inbounds cannot stack drains.
+            if not getattr(self, "_ledger_draining", None):
+                self._ledger_draining = asyncio.create_task(self._drain_ledger(effective_chat_id or sender_id))
+        # V4.0.0 (2026-10-14): a new inbound is exactly one fresh-token window — re-arm the instant ack
+        # so this turn can spend it on a 3-second "收到" instead of leaving the user in silence.
+        self._arm_ack(effective_chat_id or sender_id)
         if self._poll_session and self._token and not self._typing_cache.get(sender_id):
             asyncio.create_task(self._fetch_typing_ticket(self._poll_session, sender_id, context_token or None, "getConfig failed"))
         media_paths, media_types = [], []  # type: List[str], List[str]
@@ -974,6 +1162,101 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._rate_limit_circuit_until = max(self._rate_limit_circuit_until, time.monotonic() + self._rate_limit_circuit_open_seconds)
         return self._rate_limit_cooldown_remaining() > 0
 
+    async def _drain_ledger(self, chat_id: str) -> None:
+        """V10.21.70 (2026-10-16): deliver everything the tokenless window could not, using THIS inbound's fresh token.
+
+        Contract (boss red lines):
+          * idempotent — an entry already marked ``delivered`` is never resent; ``message_key`` also collapses
+            duplicate cron writers of the same content.
+          * bounded — at most ``_LEDGER_MAX_ATTEMPTS`` attempts per entry, one attempt per inbound window (we do
+            not sleep here: sleeping would hold the event loop, and ``-2`` has proven not to be age-dependent, so
+            waiting buys nothing).
+          * terminal — an entry that exhausts its attempts is marked ``dead_letter`` and its full text is kept
+            on disk for audit; it is never silently dropped.
+          * never blocks the agent turn — failures are swallowed into the ledger, not raised.
+        """
+        me = _safe_id(chat_id)
+        try:
+            pending = [r for r in _ledger_pending() if r.get("chat_id") == chat_id]
+            if not pending:
+                return
+            logger.info("[%s] ledger drain start: %d pending for %s", self.name, len(pending), me)
+            for rec in pending:
+                key = rec.get("message_key")
+                attempts = int(rec.get("attempts") or 0)
+                if attempts >= _LEDGER_MAX_ATTEMPTS:
+                    _ledger_append({**rec, "event": "dead_letter", "attempts": attempts,
+                                    "dead_letter_ts": time.time(),
+                                    "iso": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                    logger.warning("[%s] ledger entry %s hit max attempts (%d) -> dead_letter",
+                                   self.name, me, attempts)
+                    continue
+                content = rec.get("content") or ""
+                if not content:
+                    _ledger_append({**rec, "event": "dead_letter", "attempts": attempts,
+                                    "error": "empty content",
+                                    "iso": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                    continue
+                try:
+                    # One chunk per attempt: the fresh-token window is short, so a long backlog must not
+                    # monopolise it. Anything still pending stays for the next inbound.
+                    # client_id MUST be fresh per attempt (upstream sends use uuid4), otherwise the server's
+                    # own dedupe treats every retry as a duplicate and silently drops it — the ledger would then
+                    # loop to dead_letter while the message was never actually re-sent.
+                    await self._send_text_chunk(
+                        chat_id=chat_id, chunk=content[:1500],
+                        context_token=self._token_store.get(self._account_id, chat_id),
+                        client_id=f"hermes-weixin-ledger-{uuid.uuid4().hex}")
+                except Exception as exc:
+                    attempts += 1
+                    _ledger_append({
+                        "event": "retry", "message_key": key, "chat_id": chat_id, "content": content[:4000],
+                        "error": str(exc)[:500], "attempts": attempts,
+                        "first_failed_ts": rec.get("first_failed_ts") or time.time(),
+                        "next_attempt_after_s": _LEDGER_BACKOFF[min(attempts - 1, len(_LEDGER_BACKOFF) - 1)],
+                        "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    })
+                    logger.warning("[%s] ledger resend failed (%d/%d): %s",
+                                   self.name, attempts, _LEDGER_MAX_ATTEMPTS, str(exc)[:120])
+                else:
+                    _ledger_append({**rec, "event": "delivered", "attempts": attempts + 1,
+                                    "delivered_ts": time.time(),
+                                    "iso": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                    logger.info("[%s] ledger delivered %s on attempt %d", self.name, me, attempts + 1)
+        except Exception:
+            logger.warning("[%s] ledger drain aborted for %s", self.name, me, exc_info=True)
+
+    async def _maybe_send_fresh_ack(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+        """Best-effort instant ack. Never raises, never blocks the turn, and is skipped when the turn
+        already produced visible text (no double "收到" in front of the real answer)."""
+        try:
+            if not self._ack_enabled or not self._send_session or not self._token:
+                return
+            async with self._ack_gate:
+                if chat_id in self._acked_chats:
+                    return
+                # Only ack once per inbound: the next inbound re-arms it via _arm_ack().
+                self._acked_chats.add(chat_id)
+            content = self._ack_text()
+            if not content:
+                return
+            client_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            await self._send_text_chunk(
+                chat_id=chat_id, chunk=self.format_message(content),
+                context_token=self._token_store.get(self._account_id, chat_id),
+                client_id=client_id)
+            logger.info("[%s] fresh-window ack delivered to %s (%d chars)", self.name, _safe_id(chat_id), len(content))
+        except Exception as exc:
+            # An ack is a courtesy; any failure must fall through to the real reply path untouched.
+            logger.debug("[%s] fresh-window ack failed for %s: %s", self.name, _safe_id(chat_id), exc)
+
+    def _ack_text(self) -> str:
+        return str(self._ack_message or "").strip()
+
+    def _arm_ack(self, chat_id: str) -> None:
+        """Re-arm the ack for a new inbound message (called from the inbound handler)."""
+        self._acked_chats.discard(chat_id)
+
     async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
         """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
         or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
@@ -991,6 +1274,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=chunk,
                         context_token=context_token, client_id=client_id)
                     ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
+                    # V10.21.69 (2026-10-16) READ-ONLY FORENSIC TAP. Logs the FULL iLink sendmessage response
+                    # (all keys, not just ret/errcode/errmsg) so any future -2 verdict rests on real server data
+                    # instead of inference. This call site sits right after `resp` arrives and BEFORE any
+                    # control-flow branch, so it cannot change retry/evict/fallback behaviour. Keep it until the
+                    # server starts returning a discriminable field; then it can be gated to failures only.
+                    _ilink_forensic_tap(resp, ret, errcode, context_token=context_token, chat_id=chat_id)
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
                         errmsg = resp.get("errmsg") or resp.get("msg")
                         if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
@@ -1064,7 +1353,22 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            # V10.21.70 (2026-10-16): a failed send must NOT be a lost message. The forensic tap shows
+            # cron-initiated sends fail 146/146 with ret=-2 because the peer's context_token expired long
+            # after the last inbound — and this method used to simply return failure, so the message was gone
+            # for good. Record it with an idempotency key; the next inbound refreshes the token and drains it.
+            _ledger_append({
+                "event": "send_failed",
+                "message_key": _ledger_key(chat_id, final_content),
+                "chat_id": chat_id,
+                "content": final_content,
+                "error": str(exc)[:500],
+                "attempts": 1,
+                "first_failed_ts": time.time(),
+                "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+            return SendResult(success=False, error=str(exc),
+                              error_kind=_ilink_error_kind(str(exc)))
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing via getConfig once the 600s TTL evicts it —
@@ -1087,7 +1391,18 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.debug("[%s] typing %s failed for %s: %s", self.name, label, _safe_id(chat_id), exc)
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+        """Start the typing indicator, then spend the fresh-token window on an instant ack.
+
+        V4.0.0 (2026-10-14): ``send_typing(TYPING_START)`` is the single entry point every turn path already
+        calls (run_turn.py:2822 streaming, run_turn_runner.py:685 progress), so this is the one place
+        that buys a send attempt inside the fresh-token window without touching turn orchestration.
+
+        The ack is text, not the typing indicator, so it consumes a send attempt like any reply: the
+        Nth chunk of the same turn fails at 26%/43%/61%. That cost is deliberate — one short ack that
+        lands is worth more than a perfect answer that arrives minutes later or never.
+        """
         await self._set_typing(chat_id, TYPING_START, "start")
+        await self._maybe_send_fresh_ack(chat_id, metadata)
 
     async def stop_typing(self, chat_id: str) -> None:
         await self._set_typing(chat_id, TYPING_STOP, "stop")
